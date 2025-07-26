@@ -34,21 +34,50 @@ try:
     )
     QWEN3_API_AVAILABLE = True
     print("✓ Qwen3 C++ API available")
-except ImportError as e:
+except (ImportError, OSError) as e:
     print(f"⚠ Qwen3 C++ API not available: {e}")
     print("  Falling back to jiuge API for compatibility")
-    from libinfinicore_infer import (
-        JiugeMetaCStruct as Qwen3MetaCStruct,
-        JiugeWeightsCStruct as Qwen3WeightsCStruct,
-        create_jiuge_model as create_qwen3_model,
-        destroy_jiuge_model as destroy_qwen3_model,
-        create_kv_cache as create_qwen3_kv_cache,
-        drop_kv_cache as drop_qwen3_kv_cache,
-        infer_batch as infer_qwen3_batch,
-        DataType,
-        DeviceType,
-    )
-    QWEN3_API_AVAILABLE = False
+    try:
+        from libinfinicore_infer import (
+            JiugeMetaCStruct as Qwen3MetaCStruct,
+            JiugeWeightsCStruct as Qwen3WeightsCStruct,
+            create_jiuge_model as create_qwen3_model,
+            destroy_jiuge_model as destroy_qwen3_model,
+            create_kv_cache as create_qwen3_kv_cache,
+            drop_kv_cache as drop_qwen3_kv_cache,
+            infer_batch as infer_qwen3_batch,
+            DataType,
+            DeviceType,
+        )
+        QWEN3_API_AVAILABLE = False
+    except (ImportError, OSError) as e2:
+        print(f"⚠ Jiuge API also not available: {e2}")
+        print("  Running in demonstration mode without C++ backend")
+        # Create dummy classes for demonstration
+        class DummyStruct:
+            pass
+        
+        Qwen3MetaCStruct = DummyStruct
+        Qwen3WeightsCStruct = DummyStruct
+        
+        def dummy_function(*args, **kwargs):
+            print(f"⚠ Dummy function called: would execute C++ operation")
+            return None
+        
+        create_qwen3_model = dummy_function
+        destroy_qwen3_model = dummy_function
+        create_qwen3_kv_cache = dummy_function
+        drop_qwen3_kv_cache = dummy_function
+        infer_qwen3_batch = dummy_function
+        
+        class DataType:
+            DEVICE_TYPE_CPU = "cpu"
+        
+        class DeviceType:
+            DEVICE_TYPE_CPU = "cpu"
+            DEVICE_TYPE_ASCEND = "ascend"
+        
+        QWEN3_API_AVAILABLE = False
 
 from libinfinicore_infer import KVCacheCStruct
 from infer_task import InferTask, KVCache

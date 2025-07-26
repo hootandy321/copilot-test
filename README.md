@@ -85,18 +85,62 @@ destroyQwen3Model(model);
 1. **注意力机制**: 使用简化的注意力实现，完整实现需要更多时间
 2. **滑动窗口**: 基础框架已准备，具体窗口实现待补充
 
-## 🚀 下一步验证和部署
+## 🚀 验证和测试工具
 
-### 构建测试：
+### 🔧 自动化测试套件
+
+实现了全面的测试工具来验证C++实现的计算准确性：
+
+#### 1. **完整测试套件**
+```bash
+python InfiniCore-Infer-main/scripts/qwen3_testing_demo.py /path/to/qwen3-model
+```
+自动运行所有测试并提供汇总报告。
+
+#### 2. **C++ vs PyTorch验证**
+```bash
+python InfiniCore-Infer-main/scripts/qwen3_verification.py /path/to/qwen3-model \
+    --test-inputs "Hello" "你好" "What is the capital"
+```
+对比C++实现与PyTorch参考实现的计算准确性。
+
+#### 3. **逐层对比分析**
+```bash
+python InfiniCore-Infer-main/scripts/qwen3_layer_comparison.py /path/to/qwen3-model \
+    --test-inputs "Hello" "What is" \
+    --output detailed_report.json
+```
+详细的中间计算对比，识别计算差异的具体位置。
+
+#### 4. **简化模型实现**
+```bash
+python InfiniCore-Infer-main/scripts/qwen3.py /path/to/qwen3-model cpu
+```
+正确使用qwen3 C++ API的简化实现，包含优雅降级机制。
+
+### 📊 测试功能
+
+- ✅ **令牌级准确度**对比
+- ✅ **文本相似度**评分
+- ✅ **性能基准测试**（推理时间、加速比）
+- ✅ **逐层**中间输出分析
+- ✅ **可视化**准确度图表和误差分布
+- ✅ **JSON报告**详细分析
+- ✅ **优雅降级**处理C++ API不可用情况
+
+### 🏗️ 构建测试：
 ```bash
 cd InfiniCore-Infer-main
 xmake build
 ```
 
-### 集成测试建议：
-1. **权重加载测试**: 验证Qwen3权重能否正确加载
-2. **基础推理测试**: 测试模型创建和简单推理功能
-3. **Q/K归一化验证**: 确认归一化计算的正确性
+### 📈 验证状态
+- ✅ Python层逻辑验证通过
+- ✅ 权重命名检测正常工作
+- ✅ 配置加载支持qwen3模型类型
+- ✅ **新增**: 完整测试框架已实现
+- ✅ **新增**: C++ vs Python对比工具可用
+- ⏳ 准备在算力平台进行集成测试
 
 ---
 
