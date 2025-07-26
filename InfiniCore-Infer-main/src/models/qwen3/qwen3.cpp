@@ -250,10 +250,84 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     workspace_size = std::max(workspace_size, temp_size);
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_o, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
+    
+    // RoPE descriptors (following jiuge pattern)
+    infiniopRoPEDescriptor_t desc_rope_q, desc_rope_k;
+    qkv_buf->dimSplit(1, {nh + nkvh * 2, dh}); // (ntok, nh + 2 * nkvh, dh)
+    auto qkv_buf_q = qkv_buf->slice(1, 0, nh);
+    auto qkv_buf_k = qkv_buf->slice(1, nh, nkvh);
+    RUN_INFINI(infiniopCreateRoPEDescriptor(
+        rsrc.handle, &desc_rope_q, qkv_buf_q->desc(), qkv_buf_q->desc(),
+        pos_ids_buf->desc(), rsrc.sin_table->desc(),
+        rsrc.cos_table->desc()));
+    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_q, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    RUN_INFINI(infiniopCreateRoPEDescriptor(
+        rsrc.handle, &desc_rope_k, qkv_buf_k->desc(), qkv_buf_k->desc(),
+        pos_ids_buf->desc(), rsrc.sin_table->desc(),
+        rsrc.cos_table->desc()));
+    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_k, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    
+    // Attention inner descriptors (following jiuge pattern)
+    auto desc_kv_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
+    auto desc_q_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
+    auto desc_qk_gemms = std::vector<infiniopGemmDescriptor_t>(nreq);
+    auto desc_qk_softmaxs = std::vector<infiniopCausalSoftmaxDescriptor_t>(nreq);
+    auto desc_attn_v_gemms = std::vector<infiniopGemmDescriptor_t>(nreq);
+    auto desc_attn_v_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
+    size_t token_offset = 0;
+    size_t max_qk_size = 0;
+    size_t max_seq_len = 0;
+    o_buf->dimSplit(1, {nh, dh});
+    for (uint32_t req = 0; req < nreq; req++) {
+        auto past_len = req_pos[req];
+        auto seq_len = req_lens[req];
+        auto total_len = past_len + seq_len;
+        auto o = o_buf->slice({{0, token_offset, seq_len}});
+        auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
+        auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
+        // kv cache tensors can share the same descriptor
+        // [nkvh, dh, total_len]
+        auto full_kv = kv_caches[req]->k[idev][0]->slice(0, 0, total_len)->permute({1, 2, 0});
+        auto cache_kv = kv_caches[req]->k[idev][0]->slice(0, past_len, seq_len);
 
-    // (Simplified implementation for core functionality)
-    // TODO: Add full attention mechanism similar to jiuge
-    // For now, implementing basic structure with placeholders
+        RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_kv_rearranges[req],
+                                                     cache_kv->desc(), k->desc()));
+
+        // [nkvh, ngroup, seq_len, dh] where ngroup = nh / nkvh
+        uint32_t ngroup = nh / nkvh;
+        q->dimSplit(1, {nkvh, ngroup})->permute({1, 2, 0, 3});
+        auto q_t = TensorDesc::create(dt_logits, {nkvh, ngroup, seq_len, dh});
+        // [seq_len, nkvh, ngroup, dh] -> [nkvh, ngroup, seq_len, dh]
+        RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_q_rearranges[req],
+                                                     q_t->desc(), q->desc()));
+        // [nkvh, ngroup, seq_len, dh] -> [seq_len, nkvh, ngroup, dh]
+        auto attn_v_t = q_t;
+        auto attn_v = TensorDesc::createWithOrder(dt_logits, {nkvh, ngroup, seq_len, dh}, {1, 2, 0, 3});
+        RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_attn_v_rearranges[req],
+                                                     attn_v->desc(), attn_v_t->desc()));
+        q_t = TensorDesc::create(dt_logits, {nkvh, ngroup * seq_len, dh});
+        auto qk = TensorDesc::create(dt_logits, {nkvh, ngroup * seq_len, total_len});
+        RUN_INFINI(infiniopCreateGemmDescriptor(rsrc.handle, &desc_qk_gemms[req],
+                                                qk->desc(), q_t->desc(), full_kv->desc()));
+        RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_qk_gemms[req], &temp_size));
+        workspace_size = std::max(workspace_size, temp_size);
+        RUN_INFINI(infiniopCreateCausalSoftmaxDescriptor(rsrc.handle, &desc_qk_softmaxs[req],
+                                                         qk->desc(), qk->desc()));
+        RUN_INFINI(infiniopGetCausalSoftmaxWorkspaceSize(desc_qk_softmaxs[req], &temp_size));
+        workspace_size = std::max(workspace_size, temp_size);
+        auto full_kv_v = kv_caches[req]->v[idev][0]->slice(0, 0, total_len)->permute({1, 2, 0});
+        RUN_INFINI(infiniopCreateGemmDescriptor(rsrc.handle, &desc_attn_v_gemms[req],
+                                                attn_v_t->desc(), qk->desc(), full_kv_v->desc()));
+        RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_v_gemms[req], &temp_size));
+        workspace_size = std::max(workspace_size, temp_size);
+
+        auto qk_size = nkvh * ngroup * seq_len * total_len;
+        max_qk_size = std::max(max_qk_size, qk_size);
+        max_seq_len = std::max(max_seq_len, seq_len);
+        token_offset += seq_len;
+    }
     
     // MLP descriptors
     infiniopGemmDescriptor_t desc_ffn_gate_up, desc_ffn_down;
@@ -301,6 +375,11 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     // Allocate workspace
     std::shared_ptr<Storage> workspace_storage = Storage::createFromPool(workspace_size, rsrc.memory_pool);
     void *workspace = workspace_storage->memory();
+
+    // Allocate attention buffers
+    auto qk_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
+    auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, nh/nkvh * max_seq_len, dh}, rsrc.memory_pool);
+    auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
 
     // Main computation loop
     for (uint32_t layer = 0; layer < nlayer; layer++) {
@@ -473,6 +552,20 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     }
     infiniopDestroyGemmDescriptor(desc_attn_qkv);
     infiniopDestroyGemmDescriptor(desc_attn_o);
+    
+    // Cleanup RoPE descriptors
+    infiniopDestroyRoPEDescriptor(desc_rope_q);
+    infiniopDestroyRoPEDescriptor(desc_rope_k);
+    
+    // Cleanup attention inner descriptors
+    for (uint32_t req = 0; req < nreq; req++) {
+        infiniopDestroyRearrangeDescriptor(desc_kv_rearranges[req]);
+        infiniopDestroyRearrangeDescriptor(desc_q_rearranges[req]);
+        infiniopDestroyGemmDescriptor(desc_qk_gemms[req]);
+        infiniopDestroyCausalSoftmaxDescriptor(desc_qk_softmaxs[req]);
+        infiniopDestroyGemmDescriptor(desc_attn_v_gemms[req]);
+        infiniopDestroyRearrangeDescriptor(desc_attn_v_rearranges[req]);
+    }
     
     // Cleanup Qwen3-specific descriptors
     if (has_qk_norm) {
