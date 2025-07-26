@@ -444,7 +444,7 @@ class Qwen3KVCache(KVCache):
         super().__init__(model)  # This will initialize self.tokens and other required attributes
 
     def drop(self, model):
-        drop_kv_cache(model.model_instance, self._kv_cache)
+        drop_kv_cache(model.model_instance, self._kvcache)
 
 
 class Qwen3ForCausalLM:
@@ -588,7 +588,9 @@ class Qwen3ForCausalLM:
         avg_time = total_time * 1000 / (steps - 1)
         print(f"Time per step: {avg_time:.3f}ms")
 
-        infer_task._kv_cache.drop(self)
+        # Clean up KV cache
+        if infer_task._kv_cache is not None:
+            infer_task._kv_cache.drop(self)
         return output_content, avg_time
 
     def destroy_model_instance(self):
