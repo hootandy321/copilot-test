@@ -324,8 +324,8 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
         workspace_size = std::max(workspace_size, temp_size);
 
         auto qk_size = nkvh * ngroup * seq_len * total_len;
-        max_qk_size = std::max(max_qk_size, qk_size);
-        max_seq_len = std::max(max_seq_len, seq_len);
+        max_qk_size = std::max(max_qk_size, size_t(qk_size));
+        max_seq_len = std::max(max_seq_len, size_t(seq_len));
         token_offset += seq_len;
     }
     
