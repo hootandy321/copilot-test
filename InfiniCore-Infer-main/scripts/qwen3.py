@@ -1,15 +1,15 @@
 from typing import List
 from libinfinicore_infer import (
-    Qwen3MetaCStruct,
-    Qwen3WeightsCStruct,
+    JiugeMetaCStruct,
+    JiugeWeightsCStruct,
     KVCacheCStruct,
     DataType,
     DeviceType,
-    create_qwen3_model,
-    destroy_qwen3_model,
-    create_qwen3_kv_cache,
-    drop_qwen3_kv_cache,
-    infer_qwen3_batch,
+    create_jiuge_model,
+    destroy_jiuge_model,
+    create_kv_cache,
+    drop_kv_cache,
+    infer_batch,
 )
 from infer_task import InferTask, KVCache
 
@@ -157,7 +157,7 @@ class LlamaWeightsNaming:
         )
 
 
-class Qwen3MetaFromConfig(Qwen3MetaCStruct):
+class Qwen3MetaFromConfig(JiugeMetaCStruct):
     def __init__(self, config, dtype=torch.float16, max_tokens=None):
         if dtype == torch.float16:
             dt_ = DataType.INFINI_DTYPE_F16
@@ -167,20 +167,6 @@ class Qwen3MetaFromConfig(Qwen3MetaCStruct):
             dt_ = DataType.INFINI_DTYPE_BF16
         else:
             dt_ = DataType.INFINI_DTYPE_F16
-
-        # Handle sliding window attention if specified in config
-        sliding_windows = None
-        layer_types = None
-        if "sliding_window" in config and config["sliding_window"] is not None:
-            # Create sliding window configuration
-            nlayer = config["num_hidden_layers"]
-            sliding_windows = (c_uint * nlayer)(*([config["sliding_window"]] * nlayer))
-            layer_types = (c_uint * nlayer)(*([1] * nlayer))  # 1 for sliding window
-        else:
-            # Full attention for all layers
-            nlayer = config["num_hidden_layers"]
-            sliding_windows = None
-            layer_types = None
 
         super().__init__(
             dt_logits=dt_,
@@ -201,13 +187,11 @@ class Qwen3MetaFromConfig(Qwen3MetaCStruct):
             epsilon=config["rms_norm_eps"],
             theta=(config["rope_theta"] if "rope_theta" in config else 100000.0),
             end_token=2,
-            sliding_windows=sliding_windows,
-            layer_types=layer_types,
         )
         self.torch_dtype_logits = dtype
 
 
-class Qwen3WeightsImpl(Qwen3WeightsCStruct):
+class Qwen3WeightsImpl(JiugeWeightsCStruct):
     def __init__(
         self,
         meta,
@@ -413,29 +397,6 @@ class Qwen3WeightsImpl(Qwen3WeightsCStruct):
         self.ffn_down_ptrs = [self.ffn_down_tensor[i].data_ptr() for i in range(nlayer)]
         self.ffn_down = (c_void_p * nlayer)(*self.ffn_down_ptrs)
 
-        # Handle Q/K normalization weights (Qwen3-specific)
-        if naming.q_norm(0) is not None and naming.q_norm(0) in state_dict:
-            print("Loading Q/K normalization weights...")
-            self.q_norm_tensors = [
-                state_dict[naming.q_norm(i)].to(torch_dt_norm) for i in range(nlayer)
-            ]
-            self.q_norm_ptrs = [
-                self.q_norm_tensors[i].data_ptr() for i in range(nlayer)
-            ]
-            self.q_norm = (c_void_p * nlayer)(*self.q_norm_ptrs)
-
-            self.k_norm_tensors = [
-                state_dict[naming.k_norm(i)].to(torch_dt_norm) for i in range(nlayer)
-            ]
-            self.k_norm_ptrs = [
-                self.k_norm_tensors[i].data_ptr() for i in range(nlayer)
-            ]
-            self.k_norm = (c_void_p * nlayer)(*self.k_norm_ptrs)
-        else:
-            print("No Q/K normalization weights found, using None...")
-            self.q_norm = None
-            self.k_norm = None
-
 
 class Qwen3BatchedTask:
     def __init__(self, tasks: List[InferTask]):
@@ -481,7 +442,7 @@ class Qwen3BatchedTask:
 class Qwen3KVCache(KVCache):
     def __init__(self, model):
         self.model = model
-        self._kv_cache = create_qwen3_kv_cache(model.model_instance)
+        self._kv_cache = create_kv_cache(model.model_instance)
 
     def data(self):
         return self._kv_cache
@@ -555,7 +516,7 @@ class Qwen3ForCausalLM:
         print(f"Creating Qwen3 model on {ndev} devices...")
         load_start_time = time.time()
         dev_ids = (c_int * ndev)(*[i for i in range(ndev)])
-        self.model_instance = create_qwen3_model(
+        self.model_instance = create_jiuge_model(
             byref(self.meta),
             byref(self.weights),
             device,
@@ -569,7 +530,7 @@ class Qwen3ForCausalLM:
         return self.meta.dctx
 
     def create_kv_cache(self):
-        return create_qwen3_kv_cache(self.model_instance)
+        return create_kv_cache(self.model_instance)
 
     def drop_kv_cache(self, kv_cache):
         drop_qwen3_kv_cache(self.model_instance, kv_cache)
@@ -577,7 +538,7 @@ class Qwen3ForCausalLM:
     def batch_infer_one_round(self, tasks: List[InferTask]):
         output = (c_uint * len(tasks))()
         batch_inputs = Qwen3BatchedTask(tasks)
-        infer_qwen3_batch(
+        infer_batch(
             self.model_instance,
             *(batch_inputs.input_args()),
             output,
@@ -634,7 +595,7 @@ class Qwen3ForCausalLM:
         return output_content, avg_time
 
     def destroy_model_instance(self):
-        destroy_qwen3_model(self.model_instance)
+        destroy_jiuge_model(self.model_instance)
         print("Qwen3 Model destroyed")
 
 

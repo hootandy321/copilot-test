@@ -126,9 +126,20 @@ class KVCacheCStruct(ctypes.Structure):
 
 
 def __open_library__():
-    lib_path = os.path.join(
-        os.environ.get("INFINI_ROOT"), "lib", "libinfinicore_infer.so"
-    )
+    infini_root = os.environ.get("INFINI_ROOT")
+    if infini_root is None:
+        raise EnvironmentError(
+            "INFINI_ROOT environment variable not set. "
+            "Please set it to the InfiniCore installation directory or run 'xmake install' first."
+        )
+    
+    lib_path = os.path.join(infini_root, "lib", "libinfinicore_infer.so")
+    if not os.path.exists(lib_path):
+        raise FileNotFoundError(
+            f"Library not found at {lib_path}. "
+            "Please compile the library with 'xmake' and install with 'xmake install' first."
+        )
+    
     lib = ctypes.CDLL(lib_path)
     
     # Jiuge model functions
