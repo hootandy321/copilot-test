@@ -1,6 +1,3 @@
-# Qwen3 Inference Script - Simplified version using jiuge infrastructure
-# This version eliminates custom classes and directly uses jiuge for maximum compatibility
-
 from typing import List
 from libinfinicore_infer import (
     JiugeMetaCStruct,
@@ -29,7 +26,79 @@ import transformers
 
 torch.set_default_device("cpu")
 
+# Import jiuge classes for compatibility
+from jiuge import JiugeMetaFromLlama, JiugeWeightsImpl
 
+
+class Qwen3WeightsNaming:
+    def input_embd(self):
+        return "model.embed_tokens.weight"
+
+    def output_norm(self):
+        return "model.norm.weight"
+
+    def output_embd(self):
+        return "lm_head.weight"
+
+    def attn_norm(self, i):
+        return f"model.layers.{i}.input_layernorm.weight"
+
+    def attn_q(self, i):
+        return f"model.layers.{i}.self_attn.q_proj.weight"
+
+    def attn_k(self, i):
+        return f"model.layers.{i}.self_attn.k_proj.weight"
+
+    def attn_v(self, i):
+        return f"model.layers.{i}.self_attn.v_proj.weight"
+
+    def attn_o(self, i):
+        return f"model.layers.{i}.self_attn.o_proj.weight"
+
+    def attn_q_b(self, i):
+        return f"model.layers.{i}.self_attn.q_proj.bias"
+
+    def attn_k_b(self, i):
+        return f"model.layers.{i}.self_attn.k_proj.bias"
+
+    def attn_v_b(self, i):
+        return f"model.layers.{i}.self_attn.v_proj.bias"
+
+    def ffn_norm(self, i):
+        return f"model.layers.{i}.post_attention_layernorm.weight"
+
+    def gate(self, i):
+        return f"model.layers.{i}.mlp.gate_proj.weight"
+
+    def up(self, i):
+        return f"model.layers.{i}.mlp.up_proj.weight"
+
+    def down(self, i):
+        return f"model.layers.{i}.mlp.down_proj.weight"
+
+    # Qwen3-specific Q/K normalization weights
+    def q_norm(self, i):
+        return f"model.layers.{i}.self_attn.q_norm.weight"
+
+    def k_norm(self, i):
+        return f"model.layers.{i}.self_attn.k_norm.weight"
+
+    @staticmethod
+    def match(state_dict):
+        # Check for basic Qwen3 structure and optional q_norm/k_norm
+        has_basic = (
+            "model.norm.weight" in state_dict
+            and "model.layers.0.self_attn.q_proj.weight" in state_dict
+        )
+        # Qwen3 often has q_norm and k_norm weights
+        has_qk_norm = (
+            "model.layers.0.self_attn.q_norm.weight" in state_dict
+            and "model.layers.0.self_attn.k_norm.weight" in state_dict
+        )
+        return has_basic and has_qk_norm
+
+
+# Fallback to standard Llama naming if q_norm/k_norm not available
 class LlamaWeightsNaming:
     def input_embd(self):
         return "model.embed_tokens.weight"
@@ -76,6 +145,14 @@ class LlamaWeightsNaming:
     def down(self, i):
         return f"model.layers.{i}.mlp.down_proj.weight"
 
+    # No Q/K normalization for standard Llama
+    def q_norm(self, i):
+        return None
+
+    def k_norm(self, i):
+        return None
+
+    @staticmethod
     def match(state_dict):
         return (
             "model.norm.weight" in state_dict
@@ -83,60 +160,9 @@ class LlamaWeightsNaming:
         )
 
 
-class JiugeMetaFromLlama(JiugeMetaCStruct):
-    def __init__(self, config, dtype=torch.float16, max_tokens=None):
-        if dtype == torch.float16:
-            dt_ = DataType.INFINI_DTYPE_F16
-        elif dtype == torch.float32:
-            dt_ = DataType.INFINI_DTYPE_F32
-        elif dtype == torch.bfloat16:
-            dt_ = DataType.INFINI_DTYPE_BF16
-        else:
-            dt_ = DataType.INFINI_DTYPE_F16
-
-        self.scale_input = 1.0
-        self.scale_output = 1.0
-        self.scale_o = 1.0
-        self.scale_down = 1.0
-        if (
-            "fm9g" == config["model_type"]
-            and "scale_emb" in config
-            and "scale_depth" in config
-            and "dim_model_base" in config
-        ):
-            self.scale_input = config["scale_emb"]
-            self.scale_output = config["hidden_size"] // config["dim_model_base"]
-            self.scale_o = config["scale_depth"] / math.sqrt(
-                config["num_hidden_layers"]
-            )
-            self.scale_down = config["scale_depth"] / math.sqrt(
-                config["num_hidden_layers"]
-            )
-
-        super().__init__(
-            dt_logits=dt_,
-            nlayer=config["num_hidden_layers"],
-            d=config["hidden_size"],
-            nh=config["num_attention_heads"],
-            nkvh=(
-                config["num_key_value_heads"]
-                if "num_key_value_heads" in config
-                else config["num_attention_heads"]
-            ),
-            dh=config["hidden_size"] // config["num_attention_heads"],
-            di=config["intermediate_size"],
-            dctx=(
-                config["max_position_embeddings"] if max_tokens is None else max_tokens
-            ),
-            dvoc=config["vocab_size"],
-            epsilon=config["rms_norm_eps"],
-            theta=(config["rope_theta"] if "rope_theta" in config else 100000.0),
-            end_token=2,
-        )
-        self.torch_dtype_logits = dtype
 
 
-class JiugeWeightsImpl(JiugeWeightsCStruct):
+class Qwen3WeightsImpl(JiugeWeightsCStruct):
     def __init__(
         self,
         meta,
@@ -153,15 +179,12 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         dh = meta.dh
         d = meta.d
         di = meta.di
-        scale_input = meta.scale_input
-        scale_output = meta.scale_output
-        scale_o = meta.scale_o
-        scale_down = meta.scale_down
         assert nh % nkvh == 0
         assert nh % ndev == 0
         assert nkvh % ndev == 0
         assert di % ndev == 0
         torch_dt_logits = meta.torch_dtype_logits
+        
         if torch_dt_mat == torch.float16:
             self.dt_mat = DataType.INFINI_DTYPE_F16
         elif torch_dt_mat == torch.float32:
@@ -191,13 +214,9 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         )
         self.transpose_linear_weights = 1 if transpose_weight else 0
         self.nlayer = nlayer
-        self.input_embd_tensor = (
-            state_dict[input_embd_naming].to(torch_dt_logits) * scale_input
-        )
+        self.input_embd_tensor = state_dict[input_embd_naming].to(torch_dt_logits)
         self.input_embd = self.input_embd_tensor.data_ptr()
-        self.output_norm_tensor = (
-            state_dict[naming.output_norm()].to(torch_dt_norm) * scale_output
-        )
+        self.output_norm_tensor = state_dict[naming.output_norm()].to(torch_dt_norm)
         self.output_norm = self.output_norm_tensor.data_ptr()
         self.output_embd_tensor = state_dict[output_embd_naming].to(torch_dt_mat)
         if not transpose_weight:
@@ -294,7 +313,6 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
                 .to(torch_dt_mat)
                 .contiguous()
             )
-            * scale_o
             for i in range(nlayer)
         ]
         self.attn_o_ptrs = [self.attn_o_tensor[i].data_ptr() for i in range(nlayer)]
@@ -345,14 +363,13 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
                 .to(torch_dt_mat)
                 .contiguous()
             )
-            * scale_down
             for i in range(nlayer)
         ]
         self.ffn_down_ptrs = [self.ffn_down_tensor[i].data_ptr() for i in range(nlayer)]
         self.ffn_down = (c_void_p * nlayer)(*self.ffn_down_ptrs)
 
 
-class JiugeBatchedTask:
+class Qwen3BatchedTask:
     def __init__(self, tasks: List[InferTask]):
         self.tasks = tasks
         self.nreq = len(tasks)
@@ -393,6 +410,14 @@ class JiugeBatchedTask:
         )
 
 
+class Qwen3KVCache(KVCache):
+    def __init__(self, model):
+        super().__init__(model)  # This will initialize self.tokens and other required attributes
+
+    def drop(self, model):
+        drop_kv_cache(model.model_instance, self._kvcache)
+
+
 class Qwen3ForCausalLM:
     def __init__(
         self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
@@ -406,105 +431,56 @@ class Qwen3ForCausalLM:
                     tensors_[name_] = data_.get_tensor(name_)
             return tensors_
 
-        print("Loading model weights to host...")
+        print("Loading Qwen3 model weights to host...")
         load_start_time = time.time()
 
         with open(os.path.join(model_dir_path, "config.json"), "r") as f:
             config = json.load(f)
             self.config = config
+        
         eos_token_id = self.config["eos_token_id"]
         self.eos_token_id = (
             [eos_token_id] if type(eos_token_id) == int else eos_token_id
         )
+        
         transpose_weight = (
             device != DeviceType.DEVICE_TYPE_ASCEND
         )  # y = xW is faster than y=xW^T on Ascend
-        if "llama" == config["model_type"]:
-            model = (
-                transformers.LlamaForCausalLM.from_pretrained(model_dir_path)
-                .cpu()
-                .half()
-            )
-            self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
-            self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_dir_path)
-            self.weights = JiugeWeightsImpl(
-                self.meta,
-                LlamaWeightsNaming(),
-                model.state_dict(),
-                ndev=ndev,
-                transpose_weight=transpose_weight,
-            )
-        elif "fm9g" == config["model_type"]:
-            if any(
-                file.suffix == ".safetensors" for file in Path(model_dir_path).iterdir()
-            ):
-                state_dict = load_all_safetensors_from_dir(model_dir_path)
-            else:
-                state_dict = torch.load(
-                    os.path.join(model_dir_path, "pytorch_model.bin"),
-                    weights_only=True,
-                    map_location="cpu",
-                )
-            if LlamaWeightsNaming.match(state_dict):
-                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
-                self.weights = JiugeWeightsImpl(
-                    self.meta,
-                    LlamaWeightsNaming(),
-                    state_dict,
-                    ndev=ndev,
-                    transpose_weight=transpose_weight,
-                )
-                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    model_dir_path, trust_remote_code=True
-                )
-            else:
-                raise ValueError("Unsupported weight naming")
-        elif "fm9g7b" == config["model_type"]:
-            if any(
-                file.suffix == ".safetensors" for file in Path(model_dir_path).iterdir()
-            ):
-                state_dict = load_all_safetensors_from_dir(model_dir_path)
-            else:
-                state_dict = torch.load(
-                    os.path.join(model_dir_path, "pytorch_model.bin"),
-                    weights_only=True,
-                    map_location="cpu",
-                )
-            if LlamaWeightsNaming.match(state_dict):
-                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
-                self.weights = JiugeWeightsImpl(
-                    self.meta,
-                    LlamaWeightsNaming(),
-                    state_dict,
-                    ndev=ndev,
-                    transpose_weight=transpose_weight,
-                )
-                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    model_dir_path, trust_remote_code=True
-                )
-            else:
-                raise ValueError("Unsupported weight naming")
-        elif "qwen2" == config["model_type"]:
+
+        # Load model weights
+        if any(file.suffix == ".safetensors" for file in Path(model_dir_path).iterdir()):
             state_dict = load_all_safetensors_from_dir(model_dir_path)
-            if LlamaWeightsNaming.match(state_dict):
-                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
-                self.weights = JiugeWeightsImpl(
-                    self.meta,
-                    LlamaWeightsNaming(),
-                    state_dict,
-                    ndev=ndev,
-                    transpose_weight=transpose_weight,
-                )
-                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    model_dir_path
-                )
         else:
-            raise ValueError("Unsupported model architecture")
+            state_dict = torch.load(
+                os.path.join(model_dir_path, "pytorch_model.bin"),
+                weights_only=True,
+                map_location="cpu",
+            )
+
+        # Determine weight naming scheme - Force LlamaWeightsNaming for compatibility
+        if LlamaWeightsNaming.match(state_dict):
+            print("Using LlamaWeightsNaming (jiuge compatibility mode)")
+            naming = LlamaWeightsNaming()
+        elif Qwen3WeightsNaming.match(state_dict):
+            print("Using LlamaWeightsNaming (fallback from Qwen3 for jiuge compatibility)")
+            naming = LlamaWeightsNaming()
+        else:
+            raise ValueError("Unsupported weight naming scheme")
+
+        self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+        self.weights = JiugeWeightsImpl(
+            self.meta,
+            naming,
+            state_dict,
+            ndev=ndev,
+            transpose_weight=transpose_weight,
+        )
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_dir_path)
 
         load_end_time = time.time()
         print(f"Time used: {load_end_time - load_start_time:.3f}s")
 
-        print(f"Creating model on {ndev} devices...")
+        print(f"Creating Qwen3 model on {ndev} devices...")
         load_start_time = time.time()
         dev_ids = (c_int * ndev)(*[i for i in range(ndev)])
         self.model_instance = create_jiuge_model(
@@ -528,7 +504,7 @@ class Qwen3ForCausalLM:
 
     def batch_infer_one_round(self, tasks: List[InferTask]):
         output = (c_uint * len(tasks))()
-        batch_inputs = JiugeBatchedTask(tasks)
+        batch_inputs = Qwen3BatchedTask(tasks)
         infer_batch(
             self.model_instance,
             *(batch_inputs.input_args()),
@@ -553,7 +529,7 @@ class Qwen3ForCausalLM:
             topp_,
             self.eos_token_id,
         )
-        infer_task.bind_kvcache(KVCache(self))
+        infer_task.bind_kvcache(Qwen3KVCache(self))
 
         steps = 0
         total_time = 0
@@ -582,18 +558,20 @@ class Qwen3ForCausalLM:
         avg_time = total_time * 1000 / (steps - 1)
         print(f"Time per step: {avg_time:.3f}ms")
 
-        infer_task._kv_cache.drop(self)
+        # Clean up KV cache
+        if infer_task._kv_cache is not None:
+            infer_task._kv_cache.drop(self)
         return output_content, avg_time
 
     def destroy_model_instance(self):
         destroy_jiuge_model(self.model_instance)
-        print("Model destroyed")
+        print("Qwen3 Model destroyed")
 
 
 def test():
     if len(sys.argv) < 3:
         print(
-            "Usage: python qwen3_simplified.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
+            "Usage: python qwen3.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
         )
         sys.exit(1)
     model_path = sys.argv[2]
@@ -614,7 +592,7 @@ def test():
         device_type = DeviceType.DEVICE_TYPE_ILUVATAR
     else:
         print(
-            "Usage: python qwen3_simplified.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
+            "Usage: python qwen3.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
         )
         sys.exit(1)
 
