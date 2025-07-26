@@ -129,15 +129,8 @@ class Qwen3Comparator:
         try:
             start_time = time.time()
             
-            # Format prompt for chat
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False
-            )
-            
-            # Generate response
-            output, avg_step_time = self.cpp_model.generate(formatted_prompt, max_tokens)
+            # Generate response - qwen3.py applies chat template internally
+            output, avg_step_time = self.cpp_model.generate(prompt, max_tokens)
             
             end_time = time.time()
             total_time = end_time - start_time

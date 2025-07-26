@@ -498,6 +498,22 @@ class Qwen3ForCausalLM:
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                     model_dir_path
                 )
+        elif "qwen3" == config["model_type"]:
+            state_dict = load_all_safetensors_from_dir(model_dir_path)
+            if LlamaWeightsNaming.match(state_dict):
+                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+                self.weights = JiugeWeightsImpl(
+                    self.meta,
+                    LlamaWeightsNaming(),
+                    state_dict,
+                    ndev=ndev,
+                    transpose_weight=transpose_weight,
+                )
+                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                    model_dir_path
+                )
+            else:
+                raise ValueError("Unsupported weight naming")
         else:
             raise ValueError("Unsupported model architecture")
 
@@ -579,8 +595,11 @@ class Qwen3ForCausalLM:
                 total_time += end_time - start_time
 
         print("\n")
-        avg_time = total_time * 1000 / (steps - 1)
+        avg_time = total_time * 1000 / (steps - 1) if steps > 1 else 0
         print(f"Time per step: {avg_time:.3f}ms")
+        
+        # Return output and average step time for comparison scripts
+        return output_content, avg_time
 
         infer_task._kv_cache.drop(self)
         return output_content, avg_time
