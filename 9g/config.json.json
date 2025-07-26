@@ -1,0 +1,38 @@
+{
+  "architectures": [
+    "FM9G7BForCausalLM"
+  ],
+  "attention_dropout": 0.0,
+  "auto_map": {
+    "AutoConfig": "configuration_fm9g.FM9GConfig",
+    "AutoModel": "modeling_fm9g.FM9GModel",
+    "AutoModelForCausalLM": "modeling_fm9g.FM9GForCausalLM",
+    "AutoModelForSeq2SeqLM": "modeling_fm9g.FM9GForCausalLM",
+    "AutoModelForSequenceClassification": "modeling_fm9g.FM9GForSequenceClassification"
+  },
+  "bos_token_id": 1,
+  "eos_token_id": [
+    2,
+    73440
+  ],
+  "hidden_act": "silu",
+  "hidden_size": 3584,
+  "initializer_range": 0.02,
+  "intermediate_size": 18944,
+  "max_position_embeddings": 32768,
+  "max_window_layers": 28,
+  "model_type": "fm9g7b",
+  "num_attention_heads": 28,
+  "num_hidden_layers": 28,
+  "num_key_value_heads": 28,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000.0,
+  "sliding_window": null,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.44.0",
+  "use_cache": true,
+  "use_mrope": false,
+  "use_sliding_window": false,
+  "vocab_size": 73448
+}
