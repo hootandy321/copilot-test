@@ -73,10 +73,29 @@ class LlamaWeightsNaming:
     def down(self, i):
         return f"model.layers.{i}.mlp.down_proj.weight"
 
+    def attn_q_norm(self, i):
+        return f"model.layers.{i}.self_attn.q_norm.weight"
+
+    def attn_k_norm(self, i):
+        return f"model.layers.{i}.self_attn.k_norm.weight"
+
     def match(state_dict):
         return (
             "model.norm.weight" in state_dict
             and "model.layers.0.self_attn.q_proj.weight" in state_dict
+        )
+
+
+class Qwen3WeightsNaming(LlamaWeightsNaming):
+    def has_qk_norm(self):
+        return True
+    
+    def match(state_dict):
+        return (
+            "model.norm.weight" in state_dict
+            and "model.layers.0.self_attn.q_proj.weight" in state_dict
+            and "model.layers.0.self_attn.q_norm.weight" in state_dict
+            and "model.layers.0.self_attn.k_norm.weight" in state_dict
         )
 
 
@@ -497,18 +516,27 @@ class JiugeForCauslLM:
                 )
         elif "qwen3" == config["model_type"]:
             state_dict = load_all_safetensors_from_dir(model_dir_path)
-            if LlamaWeightsNaming.match(state_dict):
-                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
-                self.weights = JiugeWeightsImpl(
-                    self.meta,
-                    LlamaWeightsNaming(),
-                    state_dict,
-                    ndev=ndev,
-                    transpose_weight=transpose_weight,
-                )
-                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    model_dir_path
-                )
+            # Try Qwen3 naming first (with q_norm/k_norm), fall back to Llama naming
+            if Qwen3WeightsNaming.match(state_dict):
+                print("Using Qwen3WeightsNaming (with q_norm/k_norm support)")
+                naming = Qwen3WeightsNaming()
+            elif LlamaWeightsNaming.match(state_dict):
+                print("Using LlamaWeightsNaming (basic support, no q_norm/k_norm)")
+                naming = LlamaWeightsNaming()
+            else:
+                raise ValueError("Unsupported qwen3 weight naming")
+            
+            self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+            self.weights = JiugeWeightsImpl(
+                self.meta,
+                naming,
+                state_dict,
+                ndev=ndev,
+                transpose_weight=transpose_weight,
+            )
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                model_dir_path
+            )
         else:
             raise ValueError("Unsupported model architecture")
 
