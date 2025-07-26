@@ -495,6 +495,20 @@ class JiugeForCauslLM:
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                     model_dir_path
                 )
+        elif "qwen3" == config["model_type"]:
+            state_dict = load_all_safetensors_from_dir(model_dir_path)
+            if LlamaWeightsNaming.match(state_dict):
+                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+                self.weights = JiugeWeightsImpl(
+                    self.meta,
+                    LlamaWeightsNaming(),
+                    state_dict,
+                    ndev=ndev,
+                    transpose_weight=transpose_weight,
+                )
+                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                    model_dir_path
+                )
         else:
             raise ValueError("Unsupported model architecture")
 
