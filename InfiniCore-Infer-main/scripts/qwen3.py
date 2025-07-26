@@ -441,14 +441,10 @@ class Qwen3BatchedTask:
 
 class Qwen3KVCache(KVCache):
     def __init__(self, model):
-        self.model = model
-        self._kv_cache = create_kv_cache(model.model_instance)
-
-    def data(self):
-        return self._kv_cache
+        super().__init__(model)  # This will initialize self.tokens and other required attributes
 
     def drop(self, model):
-        drop_qwen3_kv_cache(model.model_instance, self._kv_cache)
+        drop_kv_cache(model.model_instance, self._kv_cache)
 
 
 class Qwen3ForCausalLM:
@@ -533,7 +529,7 @@ class Qwen3ForCausalLM:
         return create_kv_cache(self.model_instance)
 
     def drop_kv_cache(self, kv_cache):
-        drop_qwen3_kv_cache(self.model_instance, kv_cache)
+        drop_kv_cache(self.model_instance, kv_cache)
 
     def batch_infer_one_round(self, tasks: List[InferTask]):
         output = (c_uint * len(tasks))()
