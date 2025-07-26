@@ -504,7 +504,12 @@ class Qwen3ForCausalLM:
             ndev=ndev,
             transpose_weight=transpose_weight,
         )
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_dir_path)
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_dir_path, trust_remote_code=True
+        )
+        # Ensure padding token is set
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         load_end_time = time.time()
         print(f"Time used: {load_end_time - load_start_time:.3f}s")
@@ -569,11 +574,7 @@ class Qwen3ForCausalLM:
             output_tokens = self.batch_infer_one_round([infer_task])
             end_time = time.time()
             steps += 1
-            output_str = (
-                self.tokenizer._tokenizer.id_to_token(output_tokens[0])
-                .replace("▁", " ")
-                .replace("<0x0A>", "\n")
-            )
+            output_str = self.tokenizer.decode([output_tokens[0]], skip_special_tokens=True)
             output_content += output_str
             print(output_str, end="", flush=True)
             if output_tokens[0] in self.eos_token_id:
