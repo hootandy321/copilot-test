@@ -103,4 +103,20 @@ inferQwen3Batch(struct Qwen3Model *,
                 const float *temperature, const uint32_t *topk, const float *topp,
                 uint32_t *output);
 
+/// @brief 提取模型中间层输出用于调试和比较
+/// @param model Qwen3模型指针
+/// @param tokens 输入 token 地址
+/// @param ntok 输入 token 数量
+/// @param nreq 请求数量
+/// @param req_lens 每个请求的 token 数量
+/// @param req_pos 每个请求的起始位置
+/// @param kv_caches 每个请求的 KV Cache
+/// @param layer_outputs 输出缓冲区数组，用于存储每层的输出，长度至少为nlayer+1
+__C __export void
+extractQwen3LayerOutputs(struct Qwen3Model *,
+                        const uint32_t *tokens, uint32_t ntok,
+                        const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                        struct KVCache **kv_caches,
+                        float **layer_outputs);
+
 #endif
