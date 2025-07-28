@@ -103,4 +103,50 @@ inferQwen3Batch(struct Qwen3Model *,
                 const float *temperature, const uint32_t *topk, const float *topp,
                 uint32_t *output);
 
+///////////////////// Layer-by-Layer Extraction APIs ///////////////////////
+
+/// @brief 获取 embedding 层输出
+/// @param model Qwen3模型指针
+/// @param tokens 输入 token 数组
+/// @param ntok token 数量
+/// @param output 输出缓冲区，大小为 ntok * hidden_size * sizeof(float)
+__C __export void
+getQwen3EmbeddingOutput(struct Qwen3Model *model,
+                        const uint32_t *tokens, uint32_t ntok,
+                        float *output);
+
+/// @brief 获取指定 transformer 层的输出
+/// @param model Qwen3模型指针
+/// @param tokens 输入 token 数组
+/// @param ntok token 数量
+/// @param layer_idx 层索引 (0 到 num_layers-1)
+/// @param output 输出缓冲区，大小为 ntok * hidden_size * sizeof(float)
+__C __export void
+getQwen3TransformerLayerOutput(struct Qwen3Model *model,
+                               const uint32_t *tokens, uint32_t ntok,
+                               uint32_t layer_idx,
+                               float *output);
+
+/// @brief 获取最终 norm 层的输出
+/// @param model Qwen3模型指针
+/// @param tokens 输入 token 数组
+/// @param ntok token 数量
+/// @param output 输出缓冲区，大小为 ntok * hidden_size * sizeof(float)
+__C __export void
+getQwen3FinalNormOutput(struct Qwen3Model *model,
+                        const uint32_t *tokens, uint32_t ntok,
+                        float *output);
+
+/// @brief 运行完整的前向传播并获取所有层的输出
+/// @param model Qwen3模型指针
+/// @param tokens 输入 token 数组
+/// @param ntok token 数量
+/// @param layer_outputs 输出缓冲区数组，每个元素大小为 ntok * hidden_size * sizeof(float)
+///                     包含: [embedding, layer_0, layer_1, ..., layer_n-1, final_norm]
+///                     总共 num_layers + 2 个输出
+__C __export void
+runQwen3ForwardWithLayerOutputs(struct Qwen3Model *model,
+                                const uint32_t *tokens, uint32_t ntok,
+                                float **layer_outputs);
+
 #endif

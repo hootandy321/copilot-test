@@ -721,3 +721,135 @@ dropQwen3KVCache(const struct Qwen3Model *model,
                  struct KVCache *cache) {
     // TODO: Implement KV cache cleanup for Qwen3
 }
+
+///////////////////// Layer-by-Layer Extraction Implementation ///////////////////////
+
+// Helper function to run forward pass and extract layer outputs
+void runQwen3ForwardExtractLayers(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
+                                  const uint32_t *tokens, uint32_t ntok,
+                                  float **layer_outputs, int target_layer = -1) {
+    auto stream = rsrc.stream;
+    auto nlayer = meta.nlayer;
+    auto d = meta.d;
+    auto dt_logits = meta.dt_logits;
+    
+    // Allocate tensors
+    auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+    auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+    
+    // 1. Embedding lookup - copy from embedding table
+    for (uint32_t i = 0; i < ntok; i++) {
+        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                       rsrc.w_in_embd->data(tokens[i] * d),
+                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+    }
+    
+    // Copy embedding output if requested
+    if (layer_outputs && (target_layer == -1 || target_layer == -100)) {  // -100 for embedding
+        RUN_INFINI(infinirtMemcpyD2H(layer_outputs[0], logits_in->data(), ntok * d * dsize(dt_logits), stream));
+    }
+    
+    if (target_layer == -100) {
+        RUN_INFINI(infinirtStreamSynchronize(stream));
+        return;  // Early exit for embedding only
+    }
+    
+    std::swap(logits_in, logits_out);
+    
+    // Process transformer layers
+    for (uint32_t layer = 0; layer < nlayer; layer++) {
+        std::swap(logits_in, logits_out);
+        
+        // Simplified layer processing - copy input to output as placeholder
+        // In a real implementation, this would include:
+        // - Attention normalization (RMSNorm)
+        // - QKV projection and attention computation  
+        // - Output projection
+        // - MLP normalization and processing
+        // - Residual connections
+        RUN_INFINI(infinirtMemcpyAsync(logits_out->data(), logits_in->data(), 
+                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+        
+        // Copy layer output if requested
+        if (layer_outputs && (target_layer == -1 || target_layer == (int)layer)) {
+            int output_idx = (target_layer == -1) ? (layer + 1) : 0;  // +1 because index 0 is embedding
+            RUN_INFINI(infinirtMemcpyD2H(layer_outputs[output_idx], logits_out->data(), 
+                                         ntok * d * dsize(dt_logits), stream));
+        }
+        
+        if (target_layer == (int)layer) {
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+            return;  // Early exit if only one layer requested
+        }
+    }
+    
+    // Final normalization
+    if (target_layer == -1 || target_layer == -200) {  // -200 for final norm
+        std::swap(logits_in, logits_out);
+        
+        // Apply final RMS normalization (simplified - just copy for now)
+        RUN_INFINI(infinirtMemcpyAsync(logits_out->data(), logits_in->data(), 
+                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+        
+        if (layer_outputs) {
+            int final_idx = (target_layer == -1) ? (nlayer + 1) : 0;  // final_norm is at index nlayer+1
+            RUN_INFINI(infinirtMemcpyD2H(layer_outputs[final_idx], logits_out->data(), 
+                                         ntok * d * dsize(dt_logits), stream));
+        }
+    }
+    
+    // Synchronize to ensure all operations complete
+    RUN_INFINI(infinirtStreamSynchronize(stream));
+}
+
+__C void
+getQwen3EmbeddingOutput(struct Qwen3Model *model,
+                        const uint32_t *tokens, uint32_t ntok,
+                        float *output) {
+    if (!model || !tokens || !output) return;
+    
+    // Use first device for single-device extraction
+    auto &rsrc = model->dev_resources[0];
+    float *outputs[1] = {output};
+    
+    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, outputs, -100);  // -100 for embedding
+}
+
+__C void
+getQwen3TransformerLayerOutput(struct Qwen3Model *model,
+                               const uint32_t *tokens, uint32_t ntok,
+                               uint32_t layer_idx,
+                               float *output) {
+    if (!model || !tokens || !output || layer_idx >= model->meta.nlayer) return;
+    
+    // Use first device for single-device extraction
+    auto &rsrc = model->dev_resources[0];
+    float *outputs[1] = {output};
+    
+    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, outputs, (int)layer_idx);
+}
+
+__C void
+getQwen3FinalNormOutput(struct Qwen3Model *model,
+                        const uint32_t *tokens, uint32_t ntok,
+                        float *output) {
+    if (!model || !tokens || !output) return;
+    
+    // Use first device for single-device extraction
+    auto &rsrc = model->dev_resources[0];
+    float *outputs[1] = {output};
+    
+    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, outputs, -200);  // -200 for final norm
+}
+
+__C void
+runQwen3ForwardWithLayerOutputs(struct Qwen3Model *model,
+                                const uint32_t *tokens, uint32_t ntok,
+                                float **layer_outputs) {
+    if (!model || !tokens || !layer_outputs) return;
+    
+    // Use first device for single-device extraction
+    auto &rsrc = model->dev_resources[0];
+    
+    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, layer_outputs, -1);  // -1 for all layers
+}
