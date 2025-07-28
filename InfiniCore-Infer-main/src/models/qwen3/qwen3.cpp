@@ -464,12 +464,12 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             // Q: [ntok * nh, dh] -> [ntok, nh * dh]
             auto q_norm_reshaped = q_norm_buf->slice(0, 0, ntok * nh);
             q_norm_reshaped->dimSplit(0, {ntok, nh});                // [ntok, nh, dh]
-            q_norm_reshaped->dimMerge(1, 3);                         // [ntok, nh * dh]
+            q_norm_reshaped->dimMerge(1, 2);                         // [ntok, nh * dh]
             
             // K: [ntok * nkvh, dh] -> [ntok, nkvh * dh]
             auto k_norm_reshaped = k_norm_buf->slice(0, 0, ntok * nkvh);
             k_norm_reshaped->dimSplit(0, {ntok, nkvh});              // [ntok, nkvh, dh]
-            k_norm_reshaped->dimMerge(1, 3);                         // [ntok, nkvh * dh]
+            k_norm_reshaped->dimMerge(1, 2);                         // [ntok, nkvh * dh]
             
             // Copy normalized Q and K back to QKV buffer
             RUN_INFINI(infinirtMemcpyAsync(
@@ -807,47 +807,322 @@ void runQwen3ForwardExtractLayers(const Qwen3Meta &meta, Qwen3DeviceResource &rs
     
     std::swap(logits_in, logits_out);
     
+    // Prepare operators and workspace for layer processing
+    size_t workspace_size = 0, temp_size = 0;
+    
+    // RMSNorm descriptors for attention and FFN normalization
+    infiniopRMSNormDescriptor_t desc_attn_norm, desc_ffn_norm;
+    RUN_INFINI(infiniopCreateRMSNormDescriptor(
+        rsrc.handle, &desc_attn_norm, logits_in->desc(),
+        logits_out->desc(), rsrc.w_attn_norm[0]->desc(),
+        meta.epsilon));
+    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_attn_norm, &workspace_size));
+    
+    RUN_INFINI(infiniopCreateRMSNormDescriptor(
+        rsrc.handle, &desc_ffn_norm, logits_in->desc(),
+        logits_out->desc(), rsrc.w_ffn_norm[0]->desc(),
+        meta.epsilon));
+    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_ffn_norm, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    
+    // Simplified GEMM descriptors for QKV and FFN
+    auto nh = meta.nh;
+    auto nkvh = meta.nkvh;  
+    auto dh = meta.dh;
+    auto di = meta.di;
+    
+    infiniopGemmDescriptor_t desc_attn_qkv, desc_attn_out, desc_ffn_gate_up, desc_ffn_down;
+    
+    // QKV projection: [ntok, d] x [d, (nh + 2*nkvh) * dh] -> [ntok, (nh + 2*nkvh) * dh]
+    RUN_INFINI(infiniopCreateGemmDescriptor(
+        rsrc.handle, &desc_attn_qkv,
+        TensorDesc::create(dt_logits, {ntok, (nh + 2 * nkvh) * dh}, {})->desc(),
+        logits_out->desc(),
+        rsrc.w_attn_qkv[0]->desc(),
+        false, false));
+        
+    // Attention output: [ntok, nh * dh] x [nh * dh, d] -> [ntok, d]
+    RUN_INFINI(infiniopCreateGemmDescriptor(
+        rsrc.handle, &desc_attn_out,
+        logits_out->desc(),
+        TensorDesc::create(dt_logits, {ntok, nh * dh}, {})->desc(),
+        rsrc.w_attn_out[0]->desc(),
+        false, false));
+        
+    // FFN gate/up: [ntok, d] x [d, 2*di] -> [ntok, 2*di]
+    RUN_INFINI(infiniopCreateGemmDescriptor(
+        rsrc.handle, &desc_ffn_gate_up,
+        TensorDesc::create(dt_logits, {ntok, 2 * di}, {})->desc(),
+        logits_out->desc(),
+        rsrc.w_ffn_gate_up[0]->desc(),
+        false, false));
+        
+    // FFN down: [ntok, di] x [di, d] -> [ntok, d]  
+    RUN_INFINI(infiniopCreateGemmDescriptor(
+        rsrc.handle, &desc_ffn_down,
+        logits_out->desc(),
+        TensorDesc::create(dt_logits, {ntok, di}, {})->desc(),
+        rsrc.w_ffn_down[0]->desc(),
+        false, false));
+    
+    // Get workspace sizes for GEMM operations
+    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_qkv, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_out, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_ffn_gate_up, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_ffn_down, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    
+    // SwiGLU descriptor for FFN activation
+    infiniopSwiGLUDescriptor_t desc_swiglu;
+    RUN_INFINI(infiniopCreateSwiGLUDescriptor(
+        rsrc.handle, &desc_swiglu,
+        TensorDesc::create(dt_logits, {ntok, di}, {})->desc(),
+        TensorDesc::create(dt_logits, {ntok, 2 * di}, {})->desc()));
+    RUN_INFINI(infiniopGetSwiGLUWorkspaceSize(desc_swiglu, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    
+    // Allocate workspace and buffers
+    std::shared_ptr<Storage> workspace_storage = Storage::createFromPool(workspace_size, rsrc.memory_pool);
+    void *workspace = workspace_storage->memory();
+    
+    auto qkv_buf = Tensor::buffer(dt_logits, {ntok, (nh + 2 * nkvh) * dh}, rsrc.memory_pool);
+    auto attn_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
+    auto ffn_buf = Tensor::buffer(dt_logits, {ntok, 2 * di}, rsrc.memory_pool);
+    auto ffn_out_buf = Tensor::buffer(dt_logits, {ntok, di}, rsrc.memory_pool);
+    auto residual_buf = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+    
+    // Q/K normalization setup
+    bool has_qk_norm = rsrc.w_q_norm.size() > 0 && rsrc.w_k_norm.size() > 0;
+    std::shared_ptr<Tensor> q_norm_buf, k_norm_buf;
+    if (has_qk_norm) {
+        q_norm_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
+        k_norm_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);
+        workspace_size = std::max(workspace_size, rsrc.qk_norm_workspace_size);
+    }
+
     // Process transformer layers
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         std::swap(logits_in, logits_out);
         
-        // Simplified layer processing - copy input to output as placeholder
-        // In a real implementation, this would include:
-        // - Attention normalization (RMSNorm)
-        // - QKV projection and attention computation
-        // - Output projection
-        // - MLP normalization and processing
-        // - Residual connections
-        RUN_INFINI(infinirtMemcpyAsync(logits_out->data(), logits_in->data(),
+        // Save input for residual connection
+        RUN_INFINI(infinirtMemcpyAsync(residual_buf->data(), logits_in->data(),
                                        ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+        
+        // 1. Attention layer normalization
+        RUN_INFINI(infiniopRMSNorm(
+            desc_attn_norm, workspace, workspace_size,
+            logits_out->data(), logits_in->data(),
+            rsrc.w_attn_norm[layer]->data(), stream));
+
+        // 2. QKV projection
+        RUN_INFINI(infiniopGemm(
+            desc_attn_qkv, workspace, workspace_size,
+            qkv_buf->data(), logits_out->data(),
+            rsrc.w_attn_qkv[layer]->data(), 1.0, 0.0, stream));
+
+        // 3. Qwen3-specific: Q/K normalization (if enabled)
+        if (has_qk_norm) {
+            // Extract Q and K tensors from QKV buffer
+            auto q_tensor = qkv_buf->slice(1, 0, nh * dh);           // [ntok, nh * dh]
+            auto k_tensor = qkv_buf->slice(1, nh * dh, nkvh * dh);   // [ntok, nkvh * dh]
+            
+            // Reshape Q tensor for per-head normalization: [ntok, nh * dh] -> [ntok * nh, dh]
+            q_tensor->dimSplit(1, {nh, dh});                         // [ntok, nh, dh]
+            q_tensor->dimMerge(0, 2);                                // [ntok * nh, dh]
+            
+            // Apply Q normalization
+            RUN_INFINI(infiniopRMSNorm(
+                rsrc.desc_q_norm[layer], workspace, workspace_size,
+                q_norm_buf->data(), q_tensor->data(),
+                rsrc.w_q_norm[layer]->data(), stream));
+            
+            // Reshape K tensor for per-head normalization: [ntok, nkvh * dh] -> [ntok * nkvh, dh]
+            k_tensor->dimSplit(1, {nkvh, dh});                       // [ntok, nkvh, dh]
+            k_tensor->dimMerge(0, 2);                                // [ntok * nkvh, dh]
+            
+            // Apply K normalization
+            RUN_INFINI(infiniopRMSNorm(
+                rsrc.desc_k_norm[layer], workspace, workspace_size,
+                k_norm_buf->data(), k_tensor->data(),
+                rsrc.w_k_norm[layer]->data(), stream));
+            
+            // Reshape normalized tensors back and copy to QKV buffer
+            auto q_norm_reshaped = q_norm_buf->slice(0, 0, ntok * nh);
+            q_norm_reshaped->dimSplit(0, {ntok, nh});                // [ntok, nh, dh]
+            q_norm_reshaped->dimMerge(1, 2);                         // [ntok, nh * dh]
+            
+            auto k_norm_reshaped = k_norm_buf->slice(0, 0, ntok * nkvh);
+            k_norm_reshaped->dimSplit(0, {ntok, nkvh});              // [ntok, nkvh, dh]
+            k_norm_reshaped->dimMerge(1, 2);                         // [ntok, nkvh * dh]
+            
+            // Copy normalized Q and K back to QKV buffer
+            RUN_INFINI(infinirtMemcpyAsync(
+                qkv_buf->data(), q_norm_reshaped->data(),
+                ntok * nh * dh * dsize(dt_logits),
+                INFINIRT_MEMCPY_D2D, stream));
+            
+            RUN_INFINI(infinirtMemcpyAsync(
+                qkv_buf->data(nh * dh * dsize(dt_logits)), k_norm_reshaped->data(),
+                ntok * nkvh * dh * dsize(dt_logits),
+                INFINIRT_MEMCPY_D2D, stream));
+        }
+
+        // 4. Simplified attention computation (extract Q only, skip attention mechanism)
+        // For layer extraction, we just use the Q projection as a representation
+        RUN_INFINI(infinirtMemcpyAsync(attn_buf->data(), qkv_buf->data(),
+                                       ntok * nh * dh * dsize(dt_logits),
+                                       INFINIRT_MEMCPY_D2D, stream));
+
+        // 5. Attention output projection
+        auto attn_out_buf = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+        RUN_INFINI(infiniopGemm(
+            desc_attn_out, workspace, workspace_size,
+            attn_out_buf->data(), attn_buf->data(),
+            rsrc.w_attn_out[layer]->data(), 1.0, 0.0, stream));
+
+        // 6. Residual connection after attention using infiniopAdd
+        infiniopAddDescriptor_t desc_add_attn;
+        RUN_INFINI(infiniopCreateAddDescriptor(
+            rsrc.handle, &desc_add_attn,
+            logits_out->desc(), // output: [ntok, d]
+            attn_out_buf->desc(), // input A: attention output [ntok, d]
+            residual_buf->desc())); // input B: residual [ntok, d]
+        
+        size_t add_attn_workspace_size;
+        RUN_INFINI(infiniopGetAddWorkspaceSize(desc_add_attn, &add_attn_workspace_size));
+        
+        // Use existing workspace or allocate new one if needed
+        void *add_attn_workspace = workspace;
+        std::shared_ptr<Storage> add_attn_workspace_storage;
+        if (add_attn_workspace_size > workspace_size) {
+            add_attn_workspace_storage = Storage::createFromPool(add_attn_workspace_size, rsrc.memory_pool);
+            add_attn_workspace = add_attn_workspace_storage->memory();
+        }
+        
+        RUN_INFINI(infiniopAdd(
+            desc_add_attn, add_attn_workspace, add_attn_workspace_size,
+            logits_out->data(), attn_out_buf->data(), residual_buf->data(), stream));
+            
+        infiniopDestroyAddDescriptor(desc_add_attn);
+
+        // Save attention output for next residual
+        RUN_INFINI(infinirtMemcpyAsync(residual_buf->data(), logits_out->data(),
+                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+
+        // 7. FFN layer normalization
+        RUN_INFINI(infiniopRMSNorm(
+            desc_ffn_norm, workspace, workspace_size,
+            logits_out->data(), logits_out->data(),
+            rsrc.w_ffn_norm[layer]->data(), stream));
+
+        // 8. FFN gate/up projection and SwiGLU activation
+        RUN_INFINI(infiniopGemm(
+            desc_ffn_gate_up, workspace, workspace_size,
+            ffn_buf->data(), logits_out->data(),
+            rsrc.w_ffn_gate_up[layer]->data(), 1.0, 0.0, stream));
+
+        RUN_INFINI(infiniopSwiGLU(
+            desc_swiglu, workspace, workspace_size,
+            ffn_out_buf->data(), ffn_buf->data(), stream));
+
+        // 9. FFN down projection
+        RUN_INFINI(infiniopGemm(
+            desc_ffn_down, workspace, workspace_size,
+            logits_out->data(), ffn_out_buf->data(),
+            rsrc.w_ffn_down[layer]->data(), 1.0, 0.0, stream));
+
+        // 10. Residual connection after FFN using infiniopAdd
+        infiniopAddDescriptor_t desc_add_ffn;
+        RUN_INFINI(infiniopCreateAddDescriptor(
+            rsrc.handle, &desc_add_ffn,
+            logits_out->desc(), // output: [ntok, d]
+            logits_out->desc(), // input A: FFN output [ntok, d]  
+            residual_buf->desc())); // input B: residual [ntok, d]
+        
+        size_t add_workspace_size;
+        RUN_INFINI(infiniopGetAddWorkspaceSize(desc_add_ffn, &add_workspace_size));
+        
+        // Use existing workspace or allocate new one if needed
+        void *add_workspace = workspace;
+        std::shared_ptr<Storage> add_workspace_storage;
+        if (add_workspace_size > workspace_size) {
+            add_workspace_storage = Storage::createFromPool(add_workspace_size, rsrc.memory_pool);
+            add_workspace = add_workspace_storage->memory();
+        }
+        
+        RUN_INFINI(infiniopAdd(
+            desc_add_ffn, add_workspace, add_workspace_size,
+            logits_out->data(), logits_out->data(), residual_buf->data(), stream));
+            
+        infiniopDestroyAddDescriptor(desc_add_ffn);
         
         // Copy layer output if requested
         if (layer_outputs && (target_layer == -1 || target_layer == (int)layer)) {
             int output_idx = (target_layer == -1) ? (layer + 1) : 0;  // +1 because index 0 is embedding
-            // RUN_INFINI(infinirtMemcpyD2H(layer_outputs[output_idx], logits_out->data(),
-            //                              ntok * d * dsize(dt_logits), stream));
             RUN_INFINI(infinirtMemcpyAsync(layer_outputs[output_idx], logits_out->data(),
                                            ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
         }
         
         if (target_layer == (int)layer) {
+            // Clean up descriptors before early exit
+            infiniopDestroyRMSNormDescriptor(desc_attn_norm);
+            infiniopDestroyRMSNormDescriptor(desc_ffn_norm);
+            infiniopDestroyGemmDescriptor(desc_attn_qkv);
+            infiniopDestroyGemmDescriptor(desc_attn_out);
+            infiniopDestroyGemmDescriptor(desc_ffn_gate_up);
+            infiniopDestroyGemmDescriptor(desc_ffn_down);
+            infiniopDestroySwiGLUDescriptor(desc_swiglu);
+            
             RUN_INFINI(infinirtStreamSynchronize(stream));
             return;  // Early exit if only one layer requested
         }
     }
     
+    // Clean up descriptors
+    infiniopDestroyRMSNormDescriptor(desc_attn_norm);
+    infiniopDestroyRMSNormDescriptor(desc_ffn_norm);
+    infiniopDestroyGemmDescriptor(desc_attn_qkv);
+    infiniopDestroyGemmDescriptor(desc_attn_out);
+    infiniopDestroyGemmDescriptor(desc_ffn_gate_up);
+    infiniopDestroyGemmDescriptor(desc_ffn_down);
+    infiniopDestroySwiGLUDescriptor(desc_swiglu);
+    
     // Final normalization
     if (target_layer == -1 || target_layer == -200) {  // -200 for final norm
         std::swap(logits_in, logits_out);
         
-        // Apply final RMS normalization (simplified - just copy for now)
-        RUN_INFINI(infinirtMemcpyAsync(logits_out->data(), logits_in->data(),
-                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+        // Apply final RMS normalization
+        infiniopRMSNormDescriptor_t desc_final_norm;
+        RUN_INFINI(infiniopCreateRMSNormDescriptor(
+            rsrc.handle, &desc_final_norm, logits_in->desc(),
+            logits_out->desc(), rsrc.w_out_norm->desc(),
+            meta.epsilon));
+        
+        size_t final_norm_workspace_size;
+        RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_final_norm, &final_norm_workspace_size));
+        
+        // Reuse or allocate workspace for final norm
+        std::shared_ptr<Storage> final_workspace_storage;
+        void *final_workspace;
+        if (final_norm_workspace_size <= workspace_size) {
+            final_workspace = workspace;
+        } else {
+            final_workspace_storage = Storage::createFromPool(final_norm_workspace_size, rsrc.memory_pool);
+            final_workspace = final_workspace_storage->memory();
+        }
+        
+        RUN_INFINI(infiniopRMSNorm(
+            desc_final_norm, final_workspace, final_norm_workspace_size,
+            logits_out->data(), logits_in->data(),
+            rsrc.w_out_norm->data(), stream));
+        
+        infiniopDestroyRMSNormDescriptor(desc_final_norm);
         
         if (layer_outputs) {
             int final_idx = (target_layer == -1) ? (nlayer + 1) : 0;  // final_norm is at index nlayer+1
-            // RUN_INFINI(infinirtMemcpyD2H(layer_outputs[final_idx], logits_out->data(),
-            //                              ntok * d * dsize(dt_logits), stream));
             RUN_INFINI(infinirtMemcpyAsync(layer_outputs[final_idx], logits_out->data(),
                                            ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
         }
