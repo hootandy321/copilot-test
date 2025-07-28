@@ -422,15 +422,18 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, nh/nkvh * max_seq_len, dh}, rsrc.memory_pool);
     auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
 
-    // Main computation loop
+    // Main computation loop - follows Qwen3 architecture exactly:
+    // inputs -> embedding[1] -> RMS-LayerNorm -> Multi_Head Attention[2] -> Add[1][2]->[3] 
+    // -> RMS-LayerNorm -> MLP[4] -> Add[3][4] -> (repeat for each layer)
+    // -> Final: RMS-LayerNorm -> Token-Linear -> ArgMax
     for (uint32_t layer = 0; layer < nlayer; layer++) {
-        // 1. Attention layer normalization
+        // 1. Pre-attention RMS LayerNorm: normalize input for attention
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_attn_norm[layer]->data(), stream));
 
-        // 2. QKV projection
+        // 2. Multi-Head Attention: QKV projection -> Q-Linear(B,S,64,128), K-Linear(B,S,8,128), V-Linear(B,S,8,128)
         if (has_qkv_bias) {
             RUN_INFINI(infiniopRearrange(
                 desc_qkv_bias,
@@ -441,7 +444,7 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             qkv_buf->data(), logits_out->data(),
             rsrc.w_attn_qkv[layer]->data(), 1.0, has_qkv_bias ? 1.0 : 0.0, stream));
 
-        // 3. Qwen3-specific: Q/K normalization
+        // 3. RMS-LayerNorm on Q and K (Qwen3-specific feature)
         if (has_qk_norm) {
             // Extract Q and K tensors from QKV buffer for normalization
             // QKV layout: [ntok, (nh + 2*nkvh) * dh] where first nh*dh is Q, next nkvh*dh is K
@@ -491,7 +494,7 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
                 INFINIRT_MEMCPY_D2D, stream));
         }
 
-        // 4. RoPE
+        // 4. RoPE (Rotational Position Encoding): apply to Q and K tensors
         RUN_INFINI(infiniopRoPE(
             desc_rope_q, workspace, workspace_size,
             qkv_buf->data(), qkv_buf->data(),
@@ -506,7 +509,7 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             rsrc.cos_table->data(),
             stream));
 
-        // 5. Attention computation (following jiuge pattern)
+        // 5. Attention computation: Transpose -> MatMul -> Divide -> Mask -> Softmax -> MatMul with V
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto past_len = req_pos[req];
@@ -548,14 +551,13 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             token_offset += seq_len;
         }
         
-        // 6. Output projection
-        // o_proj
+        // 6. Attention Output projection: Reshape -> O-Linear (B,S,5120)
         RUN_INFINI(infiniopGemm(
             desc_attn_o, workspace, workspace_size,
             logits_out->data(), o_buf->data(),
             rsrc.w_attn_out[layer]->data(), 1.0, 0.0, stream)); // No residual in GEMM
         
-        // 6.1. Add residual connection: [1] + [2] -> [3] (embedding + attention_output -> residual_1)
+        // 6.1. First residual connection: Add embedding[1] + attention_output[2] -> residual_1[3]
         if (idev == 0) {
             // Add the residual connection: logits_out = logits_in + logits_out
             infiniopAddDescriptor_t desc_add_attn;
@@ -577,30 +579,31 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
 
-        // 7. FFN layer normalization on residual_1 [3]
+        // 7. Pre-MLP RMS LayerNorm: normalize residual_1[3] for MLP input
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_ffn_norm[layer]->data(), stream));
         
-        // 8. FFN Gate-Up projection
+        // 8. MLP module: Gate-Linear + Up-Linear -> SiLU + Mul -> Down-Linear
+        // 8.1. Gate-Up projection: produces Gate-Linear and Up-Linear (B,S,25600) each
         RUN_INFINI(infiniopGemm(
             desc_ffn_gate_up, workspace, workspace_size,
             gate_up_buf->data(), logits_out->data(), rsrc.w_ffn_gate_up[layer]->data(),
             1.0, 0.0, stream));
         
-        // 9. SwiGLU (SiLU + Mul): Gate-Linear -> SiLU -> Mul with Up-Linear
+        // 8.2. SwiGLU: Gate-Linear -> SiLU -> Mul with Up-Linear 
         RUN_INFINI(infiniopSwiGLU(
             desc_swiglu, workspace, workspace_size,
             gate_buf->data(), up_buf->data(), gate_buf->data(), stream));
         
-        // 10. FFN Down projection  
+        // 8.3. Down projection: (B,S,25600) -> (B,S,5120)
         RUN_INFINI(infiniopGemm(
             desc_ffn_down, workspace, workspace_size,
             logits_out->data(), gate_buf->data(),
             rsrc.w_ffn_down[layer]->data(), 1.0, 0.0, stream)); // No residual in GEMM
         
-        // 10.1. Add residual connection: [3] + [4] -> next layer input (residual_1 + mlp_output)
+        // 8.4. Second residual connection: Add residual_1[3] + mlp_output[4] -> next layer input
         if (idev == 0) {
             // Add the residual connection: logits_in = logits_in + logits_out  
             infiniopAddDescriptor_t desc_add_mlp;
@@ -623,23 +626,26 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
         }
     }
 
-    // Output and sampling (similar to jiuge)
+    // Final output processing: RMS-LayerNorm -> Token-Linear -> ArgMax (B,S,151936)
     if (idev == 0) {
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto seq_len = req_lens[req];
             token_offset += seq_len;
+            // Final RMS LayerNorm on last layer output
             RUN_INFINI(infiniopRMSNorm(
                 desc_norm_out, workspace, workspace_size,
                 logits_out->data(req * d),
                 logits_in->data((token_offset - 1) * d),
                 rsrc.w_out_norm->data(), stream));
         }
+        // Token-Linear: (B,S,5120) -> (B,S,151936) vocabulary projection
         RUN_INFINI(infiniopGemm(
             desc_out_embd, workspace, workspace_size,
             prob_buf->data(), logits_out->data(),
             rsrc.w_out_embd->data(), 1.0, 0.0, stream));
         
+        // ArgMax sampling: final output layer with sampling (includes argmax functionality)
         std::random_device _rd;
         std::mt19937 gen(_rd());
         token_offset = 0;
