@@ -265,6 +265,14 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
         workspace_size = std::max(workspace_size, rsrc.qk_norm_workspace_size);
     }
 
+    // Add operator workspace size (for residual connections)
+    infiniopAddDescriptor_t desc_add_temp;
+    RUN_INFINI(infiniopCreateAddDescriptor(
+        rsrc.handle, &desc_add_temp, logits_in->desc(), logits_in->desc(), logits_out->desc()));
+    RUN_INFINI(infiniopGetAddWorkspaceSize(desc_add_temp, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    infiniopDestroyAddDescriptor(desc_add_temp);
+
     // Attention operators
     infiniopGemmDescriptor_t desc_attn_qkv, desc_attn_o;
     infiniopRearrangeDescriptor_t desc_qkv_bias;
@@ -544,8 +552,22 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
         // o_proj
         RUN_INFINI(infiniopGemm(
             desc_attn_o, workspace, workspace_size,
-            logits_in->data(), o_buf->data(),
-            rsrc.w_attn_out[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
+            logits_out->data(), o_buf->data(),
+            rsrc.w_attn_out[layer]->data(), 1.0, 0.0, stream)); // No residual in GEMM
+        
+        // 6.1. Add residual connection: [1] + [2] -> [3] (embedding + attention_output -> residual_1)
+        if (idev == 0) {
+            // Add the residual connection: logits_out = logits_in + logits_out
+            infiniopAddDescriptor_t desc_add_attn;
+            RUN_INFINI(infiniopCreateAddDescriptor(
+                rsrc.handle, &desc_add_attn, logits_in->desc(), logits_in->desc(), logits_out->desc()));
+            RUN_INFINI(infiniopAdd(desc_add_attn, workspace, workspace_size, logits_in->data(), logits_in->data(), logits_out->data(), stream));
+            infiniopDestroyAddDescriptor(desc_add_attn);
+        } else {
+            // For multi-device, copy attention output to logits_in for accumulation
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(), logits_out->data(),
+                                          ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+        }
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
@@ -555,22 +577,42 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
 
-        // 7. FFN
+        // 7. FFN layer normalization on residual_1 [3]
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_ffn_norm[layer]->data(), stream));
+        
+        // 8. FFN Gate-Up projection
         RUN_INFINI(infiniopGemm(
             desc_ffn_gate_up, workspace, workspace_size,
             gate_up_buf->data(), logits_out->data(), rsrc.w_ffn_gate_up[layer]->data(),
             1.0, 0.0, stream));
+        
+        // 9. SwiGLU (SiLU + Mul): Gate-Linear -> SiLU -> Mul with Up-Linear
         RUN_INFINI(infiniopSwiGLU(
             desc_swiglu, workspace, workspace_size,
             gate_buf->data(), up_buf->data(), gate_buf->data(), stream));
+        
+        // 10. FFN Down projection  
         RUN_INFINI(infiniopGemm(
             desc_ffn_down, workspace, workspace_size,
-            logits_in->data(), gate_buf->data(),
-            rsrc.w_ffn_down[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream));
+            logits_out->data(), gate_buf->data(),
+            rsrc.w_ffn_down[layer]->data(), 1.0, 0.0, stream)); // No residual in GEMM
+        
+        // 10.1. Add residual connection: [3] + [4] -> next layer input (residual_1 + mlp_output)
+        if (idev == 0) {
+            // Add the residual connection: logits_in = logits_in + logits_out  
+            infiniopAddDescriptor_t desc_add_mlp;
+            RUN_INFINI(infiniopCreateAddDescriptor(
+                rsrc.handle, &desc_add_mlp, logits_in->desc(), logits_in->desc(), logits_out->desc()));
+            RUN_INFINI(infiniopAdd(desc_add_mlp, workspace, workspace_size, logits_in->data(), logits_in->data(), logits_out->data(), stream));
+            infiniopDestroyAddDescriptor(desc_add_mlp);
+        } else {
+            // For multi-device, copy MLP output to temp buffer for accumulation
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(), logits_out->data(),
+                                          ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
+        }
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
