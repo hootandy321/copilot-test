@@ -1,5 +1,5 @@
-#ifndef MODEL_JIUGE_H
-#define MODEL_JIUGE_H
+#ifndef MODEL_QWEN3_H
+#define MODEL_QWEN3_H
 
 #include <infiniccl.h>
 #include <infiniop.h>
@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <cstddef>
 
-struct JiugeModel;
+struct Qwen3Model;
 
 typedef struct
 {
@@ -16,7 +16,10 @@ typedef struct
     size_t nlayer, d, nh, nkvh, dh, di, dctx, dvoc;
     float epsilon, theta;
     uint32_t end_token;
-} JiugeMeta;
+    // Qwen3-specific: sliding window configuration
+    const uint32_t *sliding_windows;  // per-layer sliding window sizes, NULL for full attention
+    const uint32_t *layer_types;      // per-layer attention types (0=full, 1=sliding)
+} Qwen3Meta;
 
 typedef struct
 {
@@ -44,37 +47,42 @@ typedef struct
     const void *const *ffn_gate_up;
     // nlayer * [ndev, d, di / ndev]
     const void *const *ffn_down;
-} JiugeWeights;
+    // Qwen3-specific: Q/K normalization weights
+    // nlayer * [dh]  - per head normalization for query
+    const void *const *q_norm;
+    // nlayer * [dh]  - per head normalization for key  
+    const void *const *k_norm;
+} Qwen3Weights;
 
 //////////////////// APIs ///////////////////////
-/// @brief 创建模型
+/// @brief 创建Qwen3模型
 /// @param device 协处理器种类
 /// @param ndev 协处理器数量
 /// @param dev_ids 协处理器编号，长度为 ndev
-__C __export struct JiugeModel *
-createJiugeModel(const JiugeMeta *,
-                 const JiugeWeights *,
+__C __export struct Qwen3Model *
+createQwen3Model(const Qwen3Meta *,
+                 const Qwen3Weights *,
                  infiniDevice_t device,
                  int ndev,
                  const int *dev_ids);
 
-/// @brief 销毁模型
+/// @brief 销毁Qwen3模型
 __C __export void
-destroyJiugeModel(struct JiugeModel *);
+destroyQwen3Model(struct Qwen3Model *);
 
 /// @brief 创建 KV Cache
 __C __export struct KVCache *
-createKVCache(const struct JiugeModel *);
+createQwen3KVCache(const struct Qwen3Model *);
 
 /// @brief 复制 KV Cache
 __C __export struct KVCache *
-duplicateKVCache(const struct JiugeModel *,
-                 const struct KVCache *, uint32_t seq_len);
+duplicateQwen3KVCache(const struct Qwen3Model *,
+                      const struct KVCache *, uint32_t seq_len);
 
 /// @brief 销毁 KV Cache
 __C __export void
-dropKVCache(const struct JiugeModel *,
-            struct KVCache *);
+dropQwen3KVCache(const struct Qwen3Model *,
+                 struct KVCache *);
 
 /// @brief 批次推理一轮
 /// @param tokens 输入 token 地址
@@ -88,11 +96,11 @@ dropKVCache(const struct JiugeModel *,
 /// @param topp 采样 topp
 /// @param output 输出 token 数组，每个请求一个输出，长度至少为nreq
 __C __export void
-inferBatch(struct JiugeModel *,
-           const uint32_t *tokens, uint32_t ntok,
-           const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
-           struct KVCache **kv_caches,
-           const float *temperature, const uint32_t *topk, const float *topp,
-           uint32_t *output);
+inferQwen3Batch(struct Qwen3Model *,
+                const uint32_t *tokens, uint32_t ntok,
+                const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                struct KVCache **kv_caches,
+                const float *temperature, const uint32_t *topk, const float *topp,
+                uint32_t *output);
 
 #endif

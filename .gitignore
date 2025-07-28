@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Build artifacts
+/InfiniCore-main/build/
+/InfiniCore-Infer-main/build/
+*.o
+*.a
+*.lib
+*.dll
+
+# Model files (typically large)
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+
+# Logs
+*.log
