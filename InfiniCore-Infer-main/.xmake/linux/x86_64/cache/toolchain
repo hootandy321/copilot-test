@@ -1,0 +1,103 @@
+{
+    tool_target_infinicore_infer_linux_x86_64_cxx = {
+        toolname = "gcc",
+        toolchain_info = {
+            name = "gcc",
+            plat = "linux",
+            cachekey = "gcc_arch_x86_64_plat_linux",
+            arch = "x86_64"
+        },
+        program = "/usr/bin/gcc"
+    },
+    cross_arch_x86_64_plat_linux = {
+        __checked = false,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    go_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    rust_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    fpc_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    fasm_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    yasm_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    nasm_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    nim_arch_x86_64_plat_linux = {
+        __checked = false,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    cuda_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    gfortran_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    gcc_arch_x86_64_plat_linux = {
+        __checked = {
+            name = "gcc",
+            program = "/usr/bin/gcc"
+        },
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    envs_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    swift_arch_x86_64_plat_linux = {
+        __checked = true,
+        __global = true,
+        plat = "linux",
+        arch = "x86_64"
+    },
+    tool_target_infinicore_infer_linux_x86_64_sh = {
+        toolchain_info = {
+            name = "gcc",
+            plat = "linux",
+            cachekey = "gcc_arch_x86_64_plat_linux",
+            arch = "x86_64"
+        },
+        toolname = "gxx",
+        program = "/usr/bin/g++"
+    }
+}

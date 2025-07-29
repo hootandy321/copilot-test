@@ -73,7 +73,51 @@ class JiugeWeightsCStruct(ctypes.Structure):
     ]
 
 
+class Qwen3MetaCStruct(ctypes.Structure):
+    _fields_ = [
+        ("dt_logits", DataType),
+        ("nlayer", c_size_t),
+        ("d", c_size_t),
+        ("nh", c_size_t),
+        ("nkvh", c_size_t),
+        ("dh", c_size_t),
+        ("di", c_size_t),
+        ("dctx", c_size_t),
+        ("dvoc", c_size_t),
+        ("epsilon", c_float),
+        ("theta", c_float),
+        ("end_token", c_uint),
+        ("sliding_windows", POINTER(c_uint)),
+        ("layer_types", POINTER(c_uint)),
+    ]
+
+
+class Qwen3WeightsCStruct(ctypes.Structure):
+    _fields_ = [
+        ("nlayer", c_size_t),
+        ("dt_norm", DataType),
+        ("dt_mat", DataType),
+        ("transpose_linear_weights", c_int),
+        ("input_embd", c_void_p),
+        ("output_norm", c_void_p),
+        ("output_embd", c_void_p),
+        ("attn_norm", POINTER(c_void_p)),
+        ("attn_qkv", POINTER(c_void_p)),
+        ("attn_qkv_b", POINTER(c_void_p)),
+        ("attn_o", POINTER(c_void_p)),
+        ("ffn_norm", POINTER(c_void_p)),
+        ("ffn_gate_up", POINTER(c_void_p)),
+        ("ffn_down", POINTER(c_void_p)),
+        ("q_norm", POINTER(c_void_p)),
+        ("k_norm", POINTER(c_void_p)),
+    ]
+
+
 class JiugeModelCSruct(ctypes.Structure):
+    pass
+
+
+class Qwen3ModelCStruct(ctypes.Structure):
     pass
 
 
@@ -82,10 +126,23 @@ class KVCacheCStruct(ctypes.Structure):
 
 
 def __open_library__():
-    lib_path = os.path.join(
-        os.environ.get("INFINI_ROOT"), "lib", "libinfinicore_infer.so"
-    )
+    infini_root = os.environ.get("INFINI_ROOT")
+    if infini_root is None:
+        raise EnvironmentError(
+            "INFINI_ROOT environment variable not set. "
+            "Please set it to the InfiniCore installation directory or run 'xmake install' first."
+        )
+    
+    lib_path = os.path.join(infini_root, "lib", "libinfinicore_infer.so")
+    if not os.path.exists(lib_path):
+        raise FileNotFoundError(
+            f"Library not found at {lib_path}. "
+            "Please compile the library with 'xmake' and install with 'xmake install' first."
+        )
+    
     lib = ctypes.CDLL(lib_path)
+    
+    # Jiuge model functions
     lib.createJiugeModel.restype = POINTER(JiugeModelCSruct)
     lib.createJiugeModel.argtypes = [
         POINTER(JiugeMetaCStruct),  # JiugeMeta const *
@@ -113,6 +170,34 @@ def __open_library__():
         POINTER(c_uint),  # unsigned int *output
     ]
 
+    # Qwen3 model functions
+    lib.createQwen3Model.restype = POINTER(Qwen3ModelCStruct)
+    lib.createQwen3Model.argtypes = [
+        POINTER(Qwen3MetaCStruct),  # Qwen3Meta const *
+        POINTER(Qwen3WeightsCStruct),  # Qwen3Weights const *
+        DeviceType,  # DeviceType
+        c_int,  # int ndev
+        POINTER(c_int),  # int const *dev_ids
+    ]
+    lib.destroyQwen3Model.argtypes = [POINTER(Qwen3ModelCStruct)]
+    lib.createQwen3KVCache.argtypes = [POINTER(Qwen3ModelCStruct)]
+    lib.createQwen3KVCache.restype = POINTER(KVCacheCStruct)
+    lib.dropQwen3KVCache.argtypes = [POINTER(Qwen3ModelCStruct), POINTER(KVCacheCStruct)]
+    lib.inferQwen3Batch.restype = None
+    lib.inferQwen3Batch.argtypes = [
+        POINTER(Qwen3ModelCStruct),  # struct Qwen3Model const *
+        POINTER(c_uint),  # unsigned int const *tokens
+        c_uint,  # unsigned int ntok
+        POINTER(c_uint),  # unsigned int const *req_lens
+        c_uint,  # unsigned int nreq
+        POINTER(c_uint),  # unsigned int const *req_pos
+        POINTER(POINTER(KVCacheCStruct)),  # struct KVCache **kv_caches
+        POINTER(c_float),  # float temperature
+        POINTER(c_uint),  # unsigned int topk
+        POINTER(c_float),  # float topp
+        POINTER(c_uint),  # unsigned int *output
+    ]
+
     return lib
 
 
@@ -123,3 +208,9 @@ destroy_jiuge_model = LIB.destroyJiugeModel
 create_kv_cache = LIB.createKVCache
 drop_kv_cache = LIB.dropKVCache
 infer_batch = LIB.inferBatch
+
+create_qwen3_model = LIB.createQwen3Model
+destroy_qwen3_model = LIB.destroyQwen3Model
+create_qwen3_kv_cache = LIB.createQwen3KVCache
+drop_qwen3_kv_cache = LIB.dropQwen3KVCache
+infer_qwen3_batch = LIB.inferQwen3Batch

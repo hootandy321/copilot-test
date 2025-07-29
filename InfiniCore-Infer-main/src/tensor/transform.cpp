@@ -12,6 +12,16 @@ std::shared_ptr<Tensor> Tensor::sliceImpl(const std::vector<SliceParams> &slices
 
     for (const auto &slice : slices) {
         ASSERT(slice.len > 0);
+        // Print error information for dimension and slice
+        if (slice.start >= this->shape()[slice.dim]) {
+            std::cerr << "Error: slice start (" << slice.start << ") >= dimension size (" 
+                  << this->shape()[slice.dim] << ") for dimension " << slice.dim << std::endl;
+        }
+        if (this->shape()[slice.dim] < slice.start + slice.len) {
+            std::cerr << "Error: slice end (" << slice.start + slice.len << ") > dimension size (" 
+                  << this->shape()[slice.dim] << ") for dimension " << slice.dim << std::endl;
+        }
+
         ASSERT(this->shape()[slice.dim] >= slice.start + slice.len);
         new_shape[slice.dim] = slice.len;
         offset += slice.start * this->strides()[slice.dim];

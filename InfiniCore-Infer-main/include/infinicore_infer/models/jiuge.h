@@ -6,6 +6,7 @@
 #include <infinirt.h>
 
 #include <stdint.h>
+#include <cstddef>
 
 struct JiugeModel;
 

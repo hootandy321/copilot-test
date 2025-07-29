@@ -1,6 +1,7 @@
 #include "../allocator.hpp"
 #include "../utils.hpp"
 
+
 MemoryPool::MemoryPool(size_t initialSize, size_t alignment)
     : _alignment(alignment) {
     // Validate alignment is power of two
