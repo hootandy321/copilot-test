@@ -226,7 +226,7 @@ class Qwen3Weights:
             self.attn_norm_tensors[i].data_ptr() for i in range(nlayer)
         ]
         self.attn_norm = (c_void_p * nlayer)(*self.attn_norm_ptrs)
-        
+
         # Combine Q, K, V weights into QKV tensors (following jiuge pattern)
         def qkv_slices(_i):
             # Get Q, K, V weights for layer _i
@@ -364,6 +364,10 @@ class Qwen3Weights:
         else:
             self.q_norm = None
             self.k_norm = None
+        print("DEBUG: input_embd first 5 values:",
+        self.input_embd_tensor.flatten()[:5])
+     
+        print("[DEBUG] PyTorch weight addr =", hex(self.input_embd_tensor.data_ptr()))
 
 
 class Qwen3KVCache:
@@ -429,6 +433,11 @@ class Qwen3BatchedTask:
         self.topks = (c_uint * self.nreq)(*self.topks_list)
         self.topps = (c_float * self.nreq)(*self.topps_list)
 
+        # 添加调试输出
+        # print("[DEBUG] tokens[:5]:", list(self.tokens)[:5])
+        # print("[DEBUG] req_pos:", list(self.req_pos))
+        # print("[DEBUG] req_lens:", list(self.req_lens))
+
     def input_args(self):
         return (
             self.tokens,
@@ -457,6 +466,7 @@ class Qwen3ForCausalLM:
             raise ValueError(f"Unsupported device type: {device_type}")
         
         self._load_model(model_dir_path, device, max_tokens)
+        print(f"[DEBUG] model_instance = {self.model_instance}")
     
     def _load_model(self, model_dir_path, device, max_tokens):
         """Load Qwen3 model weights and create model instance"""
@@ -776,13 +786,16 @@ class Qwen3ForCausalLM:
         batch_inputs = Qwen3BatchedTask(tasks)
         
         if self.model_instance:
+            # print("[DEBUG] Calling C++ infer_qwen3_batch...")
             infer_qwen3_batch(
                 self.model_instance,
                 *(batch_inputs.input_args()),
                 output,
             )
+            # print("[DEBUG] C++ infer finished")
         else:
             # Fallback: return dummy outputs
+            print("[DEBUG] Using Python fallback (dummy logits)")
             for i in range(len(tasks)):
                 output[i] = self.eos_token_id[0]
         
@@ -822,6 +835,7 @@ class Qwen3ForCausalLM:
         # 绑定 KV cache - 使用正确的方法
         kv_cache = self.create_kv_cache()
         task.bind_kvcache(kv_cache, 0)
+        print(f"[DEBUG] task.kvcache().data() = {task.kvcache().data()}")
         
         output_tokens = []
         
@@ -854,7 +868,7 @@ class Qwen3ForCausalLM:
         print()
         
         # Clean up - 使用正确的方法
-        task.kvcache().drop(self)
+        # task.kvcache().drop(self)
         
         end_time = time.time()
         total_time = end_time - start_time
@@ -863,7 +877,7 @@ class Qwen3ForCausalLM:
         output_text = self.tokenizer.decode(output_tokens, skip_special_tokens=True)
         
         print(f"Time per step: {avg_step_time * 1000:.3f}ms")
-        
+        print(f"[DEBUG] kv_cache = {task.kvcache().data()}")
         return output_text, avg_step_time
 def test():
     """Simple test function"""

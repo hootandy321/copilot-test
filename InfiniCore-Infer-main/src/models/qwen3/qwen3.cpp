@@ -1,20 +1,22 @@
 #include "qwen3_impl.hpp"
 #include "qwen3_weight.hpp"
-
+#include "qwen3_debug.hpp"
 #include "../../tensor.hpp"
 #include "../../utils.hpp"
-#include "infinicore_infer.h"
+
 
 #include <random>
 #include <thread>
 #include <vector>
 #include <cassert>
 
+#include <cmath>
 void createQwen3DeviceResource(Qwen3DeviceResource *rsrc, const Qwen3Meta *meta,
                                const Qwen3Weights *weights,
                                infiniDevice_t device, int idev,
                                int ndev, int dev_id,
                                infinicclComm_t comm) {
+
     RUN_INFINI(infinirtSetDevice(device, dev_id));
     infiniopHandle_t handle;
     infiniopCreateHandle(&handle);
@@ -118,6 +120,7 @@ void createQwen3DeviceResource(Qwen3DeviceResource *rsrc, const Qwen3Meta *meta,
         memory_pool,
     };
     RUN_INFINI(infinirtDeviceSynchronize());
+
 }
 
 void releaseQwen3DeviceResource(Qwen3DeviceResource &res) {
@@ -193,8 +196,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
                            struct KVCache **kv_caches,
                            const float *temperature, const uint32_t *topk, const float *topp,
                            uint32_t *output) {
-    // printf("[DEBUG] Starting inferQwen3DeviceBatch - idev=%u, ndev=%u, ntok=%u, nreq=%u\n", 
-    //        idev, ndev, ntok, nreq);
 
     auto nlayer = meta.nlayer;
     auto nkvh = meta.nkvh / ndev;
@@ -207,12 +208,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     auto stream = rsrc.stream;
     bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;
     bool has_qk_norm = rsrc.w_q_norm.size() > 0 && rsrc.w_k_norm.size() > 0;
-
-    // printf("[DEBUG] Meta parameters - nlayer=%zu, nkvh=%zu, nh=%zu, dh=%zu, d=%zu, di=%zu, dvoc=%zu\n",
-    //        nlayer, nkvh, nh, dh, d, di, dvoc);
-    // printf("[DEBUG] Features - has_qkv_bias=%s, has_qk_norm=%s\n", 
-    //        has_qkv_bias ? "true" : "false", has_qk_norm ? "true" : "false");
-
 
     // 使用正确的meta参数
     uint32_t actual_nh = nh;      // 16 
@@ -350,12 +345,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     // qkv_buf 现在是 [ntok, 32, 128] 格式，按头数切片
     auto qkv_buf_q = qkv_buf->slice(1, 0, actual_nh);        // [ntok, 16, 128]
     auto qkv_buf_k = qkv_buf->slice(1, actual_nh, actual_nkvh); // [ntok, 8, 128]
-
-    // printf("[ROPE] Creating RoPE descriptors:\n");
-    // printf("  Q tensor shape for RoPE: [%zu, %zu, %zu]\n", 
-    //        qkv_buf_q->shape()[0], qkv_buf_q->shape()[1], qkv_buf_q->shape()[2]);
-    // printf("  K tensor shape for RoPE: [%zu, %zu, %zu]\n", 
-    //        qkv_buf_k->shape()[0], qkv_buf_k->shape()[1], qkv_buf_k->shape()[2]);
 
     RUN_INFINI(infiniopCreateRoPEDescriptor(
         rsrc.handle, &desc_rope_q, qkv_buf_q->desc(), qkv_buf_q->desc(),
@@ -510,6 +499,7 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, nh/nkvh * max_seq_len, dh}, rsrc.memory_pool);
     auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
 
+    collectDebugData(logits_in, "input_logits");
     // Main computation loop - follows Qwen3 architecture exactly:
     // inputs -> embedding[1] -> RMS-LayerNorm -> Multi_Head Attention[2] -> Add[1][2]->[3] 
     // -> RMS-LayerNorm -> MLP[4] -> Add[3][4] -> (repeat for each layer)
@@ -517,10 +507,16 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // 1. Pre-attention RMS LayerNorm: normalize input for attention
         // printf("[DEBUG] Applying RMS LayerNorm for attention...\n");
+        
+
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_attn_norm[layer]->data(), stream));
+        collectDebugData(logits_in, "layer_" + std::to_string(layer) + "_rmsnorm_output");
+        // 2.norm
+        // extractTensorData(logits_in, layer_prefix + "_norm", ntok, d);
+
 
         // 2. Multi-Head Attention: QKV projection -> Q-Linear(B,S,64,128), K-Linear(B,S,8,128), V-Linear(B,S,8,128)
         // printf("[DEBUG] Applying Multi-Head Attention...\n");
@@ -534,10 +530,11 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             desc_attn_qkv, workspace, workspace_size,
             qkv_buf->data(), logits_out->data(),
             rsrc.w_attn_qkv[layer]->data(), 1.0, has_qkv_bias ? 1.0 : 0.0, stream));
+        // extractTensorData(qkv_buf, layer_prefix + "_qkv", ntok, actual_nh + actual_nkvh, actual_dh);
 
         // 3. RMS-LayerNorm on Q and K (Qwen3-specific feature)
-        // printf("[DEBUG] Applying RMS LayerNorm on Q and K...\n");
         if (has_qk_norm) {
+            // printf("[DEBUG] Applying RMS LayerNorm on Q and K...\n");
             auto q_tensor = qkv_buf->slice(1, 0, actual_nh);                    
             auto k_tensor = qkv_buf->slice(1, actual_nh, actual_nkvh);          
 
@@ -569,8 +566,9 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
                     rsrc.w_k_norm[layer]->data(), stream));
             }
         }
+        // extractTensorData(qkv_buf, layer_prefix + "_qkv_norm", ntok, actual_nh + actual_nkvh, actual_dh);
 
-                // 4. RoPE (Rotational Position Encoding): apply to Q and K tensors
+        // 4. RoPE (Rotational Position Encoding): apply to Q and K tensors
         // printf("[ROPE] Applying RoPE to Q and K tensors\n");
 
         // 对Q张量应用RoPE - 使用3D缓冲区的正确切片
@@ -601,6 +599,7 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
             auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
             auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
             auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
+            
             
             // self attention
             // concat
@@ -782,6 +781,9 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     infiniopDestroyRMSNormDescriptor(desc_norm_out);
     infiniopDestroyGemmDescriptor(desc_out_embd);
     infiniopDestroyRandomSampleDescriptor(desc_sample);
+
+    saveToJson("debug_output.json");
+
 }
 
 __C void
@@ -900,142 +902,4 @@ __C void destroyQwen3Model(struct Qwen3Model *model) {
     }
 
     delete model;
-}
-
-///////////////////// Layer-by-Layer Extraction Implementation ///////////////////////
-
-// Helper function to run forward pass and extract layer outputs
-void runQwen3ForwardExtractLayers(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
-                                  const uint32_t *tokens, uint32_t ntok,
-                                  float **layer_outputs, int target_layer = -1) {
-    auto stream = rsrc.stream;
-    auto nlayer = meta.nlayer;
-    auto d = meta.d;
-    auto dt_logits = meta.dt_logits;
-    
-    // Allocate tensors
-    auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
-    auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
-    
-    // 1. Embedding lookup - copy from embedding table
-    for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                       rsrc.w_in_embd->data(tokens[i] * d),
-                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
-    }
-    
-    // Copy embedding output if requested
-    if (layer_outputs && (target_layer == -1 || target_layer == -100)) {  // -100 for embedding
-        // RUN_INFINI(infinirtMemcpyD2H(layer_outputs[0], logits_in->data(), ntok * d * dsize(dt_logits), stream));
-        RUN_INFINI(infinirtMemcpyAsync(layer_outputs[0], logits_in->data(),
-                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
-    }
-    
-    if (target_layer == -100) {
-        RUN_INFINI(infinirtStreamSynchronize(stream));
-        return;  // Early exit for embedding only
-    }
-    
-    std::swap(logits_in, logits_out);
-    
-    // Process transformer layers
-    for (uint32_t layer = 0; layer < nlayer; layer++) {
-        std::swap(logits_in, logits_out);
-        
-        // Simplified layer processing - copy input to output as placeholder
-        // In a real implementation, this would include:
-        // - Attention normalization (RMSNorm)
-        // - QKV projection and attention computation
-        // - Output projection
-        // - MLP normalization and processing
-        // - Residual connections
-        RUN_INFINI(infinirtMemcpyAsync(logits_out->data(), logits_in->data(),
-                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
-        
-        // Copy layer output if requested
-        if (layer_outputs && (target_layer == -1 || target_layer == (int)layer)) {
-            int output_idx = (target_layer == -1) ? (layer + 1) : 0;  // +1 because index 0 is embedding
-            // RUN_INFINI(infinirtMemcpyD2H(layer_outputs[output_idx], logits_out->data(),
-            //                              ntok * d * dsize(dt_logits), stream));
-            RUN_INFINI(infinirtMemcpyAsync(layer_outputs[output_idx], logits_out->data(),
-                                           ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
-        }
-        
-        if (target_layer == (int)layer) {
-            RUN_INFINI(infinirtStreamSynchronize(stream));
-            return;  // Early exit if only one layer requested
-        }
-    }
-    
-    // Final normalization
-    if (target_layer == -1 || target_layer == -200) {  // -200 for final norm
-        std::swap(logits_in, logits_out);
-        
-        // Apply final RMS normalization (simplified - just copy for now)
-        RUN_INFINI(infinirtMemcpyAsync(logits_out->data(), logits_in->data(),
-                                       ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
-        
-        if (layer_outputs) {
-            int final_idx = (target_layer == -1) ? (nlayer + 1) : 0;  // final_norm is at index nlayer+1
-            // RUN_INFINI(infinirtMemcpyD2H(layer_outputs[final_idx], logits_out->data(),
-            //                              ntok * d * dsize(dt_logits), stream));
-            RUN_INFINI(infinirtMemcpyAsync(layer_outputs[final_idx], logits_out->data(),
-                                           ntok * d * dsize(dt_logits), INFINIRT_MEMCPY_D2D, stream));
-        }
-    }
-    
-    // Synchronize to ensure all operations complete
-    RUN_INFINI(infinirtStreamSynchronize(stream));
-}
-
-__C void
-getQwen3EmbeddingOutput(struct Qwen3Model *model,
-                        const uint32_t *tokens, uint32_t ntok,
-                        float *output) {
-    if (!model || !tokens || !output) return;
-    
-    // Use first device for single-device extraction
-    auto &rsrc = model->dev_resources[0];
-    float *outputs[1] = {output};
-    
-    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, outputs, -100);  // -100 for embedding
-}
-
-__C void
-getQwen3TransformerLayerOutput(struct Qwen3Model *model,
-                               const uint32_t *tokens, uint32_t ntok,
-                               uint32_t layer_idx,
-                               float *output) {
-    if (!model || !tokens || !output || layer_idx >= model->meta.nlayer) return;
-    
-    // Use first device for single-device extraction
-    auto &rsrc = model->dev_resources[0];
-    float *outputs[1] = {output};
-    
-    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, outputs, (int)layer_idx);
-}
-
-__C void
-getQwen3FinalNormOutput(struct Qwen3Model *model,
-                        const uint32_t *tokens, uint32_t ntok,
-                        float *output) {
-    if (!model || !tokens || !output) return;
-    
-    // Use first device for single-device extraction
-    auto &rsrc = model->dev_resources[0];
-    float *outputs[1] = {output};
-    
-    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, outputs, -200);  // -200 for final norm
-}
-
-__C void
-runQwen3ForwardWithLayerOutputs(struct Qwen3Model *model,
-                                const uint32_t *tokens, uint32_t ntok,
-                                float **layer_outputs) {
-    if (!model || !tokens || !layer_outputs) return;
-    
-    // Use first device for single-device extraction
-    auto &rsrc = model->dev_resources[0];
-    
-    runQwen3ForwardExtractLayers(model->meta, rsrc, tokens, ntok, layer_outputs, -1);  // -1 for all layers
 }
