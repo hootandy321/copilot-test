@@ -1,0 +1,77 @@
+{
+  "overall_status": "PASS",
+  "tests_passed": 4,
+  "total_tests": 5,
+  "success_rate": 0.8,
+  "individual_tests": {
+    "Input Embedding Fix": {
+      "status": "FAIL",
+      "patterns": {
+        "embedding_comment": true,
+        "embedding_loop": false,
+        "memcpy_call": false,
+        "proper_indexing": false,
+        "size_calculation": false
+      },
+      "missing_patterns": [
+        "embedding_loop",
+        "memcpy_call",
+        "proper_indexing",
+        "size_calculation"
+      ],
+      "score": "1/5"
+    },
+    "Code Structure": {
+      "status": "PASS",
+      "sections_found": {
+        "buffer_allocation": 225,
+        "embedding_fix": 295,
+        "debug_collection": 524,
+        "transformer_layers": 515
+      },
+      "structure_checks": {
+        "has_all_sections": true,
+        "correct_order": true,
+        "embedding_before_layers": true
+      },
+      "score": "3/3"
+    },
+    "Jiuge Comparison": {
+      "status": "PASS",
+      "comparison_checks": {
+        "both_have_w_in_embd": true,
+        "both_have_memcpy": true,
+        "similar_token_access": true,
+        "similar_loop_structure": true
+      },
+      "score": "4/4"
+    },
+    "Qwen3 Features": {
+      "status": "PASS",
+      "features": {
+        "qk_normalization": true,
+        "qwen3_naming": true,
+        "grouped_attention": true,
+        "rope_implementation": true,
+        "proper_tensor_shapes": true
+      },
+      "score": "5/5"
+    },
+    "Parameter Validation": {
+      "status": "PASS",
+      "parameter_checks": {
+        "tokens_parameter": true,
+        "ntok_parameter": true,
+        "bounds_checking": true,
+        "array_access": true,
+        "null_checks": true
+      },
+      "score": "5/5"
+    }
+  },
+  "summary": {
+    "bug_fixed": false,
+    "structure_valid": true,
+    "architecture_correct": true
+  }
+}
