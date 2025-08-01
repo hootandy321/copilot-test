@@ -292,6 +292,15 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, Qwen3DeviceResource &rsrc,
     // printf("[DEBUG] Position IDs buffer created\n");
     
     // printf("[DEBUG] Copying embedding data...\n");
+    
+    // CRITICAL FIX: Copy input token embeddings into logits_in buffer
+    // This was missing and caused all tensors to be zero regardless of input
+    for (uint32_t i = 0; i < ntok; i++) {
+        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d * dsize(dt_logits)),
+                                       rsrc.w_in_embd->data(tokens[i] * d * dsize(dt_logits)),
+                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+    }
+    // printf("[DEBUG] Input embeddings copied for %u tokens\n", ntok);
 
     // Prepare operators and workspace
     size_t workspace_size = 0, temp_size = 0;
