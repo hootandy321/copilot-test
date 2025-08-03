@@ -87,8 +87,10 @@ class Qwen3MetaCStruct(ctypes.Structure):
         ("epsilon", c_float),
         ("theta", c_float),
         ("end_token", c_uint),
-        ("sliding_windows", POINTER(c_uint)),
-        ("layer_types", POINTER(c_uint)),
+        ("scale_input", c_float),
+        ("scale_output", c_float),
+        ("scale_o", c_float),
+        ("scale_down", c_float),
     ]
 
 
@@ -108,8 +110,6 @@ class Qwen3WeightsCStruct(ctypes.Structure):
         ("ffn_norm", POINTER(c_void_p)),
         ("ffn_gate_up", POINTER(c_void_p)),
         ("ffn_down", POINTER(c_void_p)),
-        ("q_norm", POINTER(c_void_p)),
-        ("k_norm", POINTER(c_void_p)),
     ]
 
 
@@ -179,11 +179,11 @@ def __open_library__():
         POINTER(c_int),  # int const *dev_ids
     ]
     lib.destroyQwen3Model.argtypes = [POINTER(Qwen3ModelCStruct)]
-    lib.createQwen3KVCache.argtypes = [POINTER(Qwen3ModelCStruct)]
-    lib.createQwen3KVCache.restype = POINTER(KVCacheCStruct)
-    lib.dropQwen3KVCache.argtypes = [POINTER(Qwen3ModelCStruct), POINTER(KVCacheCStruct)]
-    lib.inferQwen3Batch.restype = None
-    lib.inferQwen3Batch.argtypes = [
+    lib.createKVCache.argtypes = [POINTER(Qwen3ModelCStruct)]
+    lib.createKVCache.restype = POINTER(KVCacheCStruct)
+    lib.dropKVCache.argtypes = [POINTER(Qwen3ModelCStruct), POINTER(KVCacheCStruct)]
+    lib.inferBatch.restype = None
+    lib.inferBatch.argtypes = [
         POINTER(Qwen3ModelCStruct),  # struct Qwen3Model const *
         POINTER(c_uint),  # unsigned int const *tokens
         c_uint,  # unsigned int ntok
@@ -210,6 +210,3 @@ infer_batch = LIB.inferBatch
 
 create_qwen3_model = LIB.createQwen3Model
 destroy_qwen3_model = LIB.destroyQwen3Model
-create_qwen3_kv_cache = LIB.createQwen3KVCache
-drop_qwen3_kv_cache = LIB.dropQwen3KVCache
-infer_qwen3_batch = LIB.inferQwen3Batch
