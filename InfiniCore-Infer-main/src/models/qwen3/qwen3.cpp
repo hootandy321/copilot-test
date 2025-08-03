@@ -8,6 +8,7 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <cmath>
 
 void createDeviceResource(DeviceResource *rsrc, const Qwen3Meta *meta,
                           const Qwen3Weights *weights,
@@ -178,27 +179,41 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
     auto qkv_buf_k = qkv_buf->slice(2, nh * dh, nkvh * dh);
     auto qkv_buf_v = qkv_buf->slice(2, nh * dh + nkvh * dh, nkvh * dh);
 
-    // Qwen3 specific: RMS norm descriptors for Q and K after projection
+    // Qwen3 specific: Per-head RMS norm descriptors for Q and K after projection
     qkv_buf_q->dimSplit(2, {nh, dh});
     qkv_buf_k->dimSplit(2, {nkvh, dh});
     
     auto q_normed = Tensor::buffer(dt_logits, qkv_buf_q->shape(), rsrc.memory_pool);
     auto k_normed = Tensor::buffer(dt_logits, qkv_buf_k->shape(), rsrc.memory_pool);
     
-    // Note: Qwen3 uses per-head RMS norm - this is a simplified implementation
-    infiniopRMSNormDescriptor_t desc_norm_q, desc_norm_k;
-    // For now, we'll apply RMS norm across the head dimension - this may need refinement
-    RUN_INFINI(infiniopCreateRMSNormDescriptor(
-        rsrc.handle, &desc_norm_q, q_normed->desc(),
-        qkv_buf_q->desc(), nullptr, epsilon)); // Using nullptr for weight - per-head norm
-    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm_q, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
+    // Qwen3 uses per-head RMS norm - normalize each head separately
+    // This is different from standard RMS norm that normalizes across the entire hidden dimension
+    std::vector<infiniopRMSNormDescriptor_t> desc_norm_q_heads(nh);
+    std::vector<infiniopRMSNormDescriptor_t> desc_norm_k_heads(nkvh);
     
-    RUN_INFINI(infiniopCreateRMSNormDescriptor(
-        rsrc.handle, &desc_norm_k, k_normed->desc(),
-        qkv_buf_k->desc(), nullptr, epsilon));
-    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm_k, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
+    // Create RMS norm descriptors for each Q head
+    for (uint32_t head = 0; head < nh; head++) {
+        auto q_head_in = qkv_buf_q->slice(2, head, 1); // [1, ntok, 1, dh]
+        auto q_head_out = q_normed->slice(2, head, 1);  // [1, ntok, 1, dh]
+        
+        RUN_INFINI(infiniopCreateRMSNormDescriptor(
+            rsrc.handle, &desc_norm_q_heads[head], q_head_out->desc(),
+            q_head_in->desc(), nullptr, epsilon)); // Per-head norm, no learnable weight
+        RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm_q_heads[head], &temp_size));
+        workspace_size = std::max(workspace_size, temp_size);
+    }
+    
+    // Create RMS norm descriptors for each K head
+    for (uint32_t head = 0; head < nkvh; head++) {
+        auto k_head_in = qkv_buf_k->slice(2, head, 1); // [1, ntok, 1, dh]
+        auto k_head_out = k_normed->slice(2, head, 1);  // [1, ntok, 1, dh]
+        
+        RUN_INFINI(infiniopCreateRMSNormDescriptor(
+            rsrc.handle, &desc_norm_k_heads[head], k_head_out->desc(),
+            k_head_in->desc(), nullptr, epsilon)); // Per-head norm, no learnable weight
+        RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm_k_heads[head], &temp_size));
+        workspace_size = std::max(workspace_size, temp_size);
+    }
 
     // RoPE descriptors
     infiniopRoPEDescriptor_t desc_rope_q, desc_rope_k;
@@ -303,16 +318,26 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
             qkv_buf->data(), logits_out->data(),
             rsrc.w_attn_qkv[layer]->data(), 1.0, 0.0, rsrc.stream));
 
-        // 3. Qwen3 specific: Apply RMS norm to Q and K after projection
-        RUN_INFINI(infiniopRMSNorm(
-            desc_norm_q, workspace, workspace_size,
-            q_normed->data(), qkv_buf_q->data(),
-            nullptr, rsrc.stream)); // Per-head norm - no weight parameter
+        // 3. Qwen3 specific: Apply per-head RMS norm to Q and K after projection
+        for (uint32_t head = 0; head < nh; head++) {
+            auto q_head_in = qkv_buf_q->slice(2, head, 1);
+            auto q_head_out = q_normed->slice(2, head, 1);
             
-        RUN_INFINI(infiniopRMSNorm(
-            desc_norm_k, workspace, workspace_size,
-            k_normed->data(), qkv_buf_k->data(),
-            nullptr, rsrc.stream));
+            RUN_INFINI(infiniopRMSNorm(
+                desc_norm_q_heads[head], workspace, workspace_size,
+                q_head_out->data(), q_head_in->data(),
+                nullptr, rsrc.stream)); // Per-head norm - no weight parameter
+        }
+        
+        for (uint32_t head = 0; head < nkvh; head++) {
+            auto k_head_in = qkv_buf_k->slice(2, head, 1);
+            auto k_head_out = k_normed->slice(2, head, 1);
+            
+            RUN_INFINI(infiniopRMSNorm(
+                desc_norm_k_heads[head], workspace, workspace_size,
+                k_head_out->data(), k_head_in->data(),
+                nullptr, rsrc.stream)); // Per-head norm - no weight parameter
+        }
 
         // 4. Apply RoPE to normalized Q and K
         RUN_INFINI(infiniopRoPE(
@@ -329,13 +354,104 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
             rsrc.sin_table->data(),
             rsrc.cos_table->data(), rsrc.stream));
 
-        // 5. Attention computation (simplified - would need full implementation)
-        // TODO: Implement proper scaled dot-product attention with KV cache
-        // For now, this is a placeholder that needs to be completed with:
-        // - KV cache update
-        // - Q @ K^T computation
-        // - Causal masking and softmax  
-        // - Attention @ V computation
+        // 5. Attention computation - complete implementation
+        // Update KV cache with current K, V values
+        uint32_t req_id = 0; // For single request processing - extend for batch later
+        uint32_t past_len = req_pos[req_id];
+        uint32_t seq_len = req_lens[req_id];
+        uint32_t total_len = past_len + seq_len;
+        
+        // Copy K, V to KV cache at appropriate positions
+        auto cache_k_current = kv_caches[req_id]->k[idev][layer];
+        auto cache_v_current = kv_caches[req_id]->v[idev][layer];
+        
+        // Update KV cache with normalized K, V
+        RUN_INFINI(infinirtMemcpyAsync(
+            cache_k_current->data(past_len * nkvh * dh),
+            k_normed->data(), 
+            seq_len * nkvh * dh * dsize(dt_logits),
+            INFINIRT_MEMCPY_D2D, rsrc.stream));
+            
+        RUN_INFINI(infinirtMemcpyAsync(
+            cache_v_current->data(past_len * nkvh * dh),
+            qkv_buf_v->data(),
+            seq_len * nkvh * dh * dsize(dt_logits), 
+            INFINIRT_MEMCPY_D2D, rsrc.stream));
+        
+        // Prepare attention computation tensors
+        auto ngroup = nh / nkvh; // Number of Q heads per KV head
+        
+        // Reshape Q for attention: [1, ntok, nh, dh] -> [1, ntok, nkvh, ngroup, dh]
+        q_normed->dimSplit(2, {nkvh, ngroup});
+        q_normed = q_normed->permute({0, 2, 3, 1, 4}); // [1, nkvh, ngroup, ntok, dh]
+        
+        // Reshape K cache for attention: [total_len, nkvh, dh] -> [1, nkvh, dh, total_len]
+        auto k_for_attn = cache_k_current->slice(0, 0, total_len)->memShare({1, nkvh, dh, total_len});
+        
+        // Compute Q @ K^T: [1, nkvh, ngroup, ntok, dh] @ [1, nkvh, dh, total_len] -> [1, nkvh, ngroup, ntok, total_len]
+        auto qk_scores = Tensor::buffer(dt_logits, {1, nkvh, ngroup, ntok, total_len}, rsrc.memory_pool);
+        
+        // Scale factor for attention
+        float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+        
+        // For each KV head, compute attention with all corresponding Q heads
+        for (uint32_t kv_head = 0; kv_head < nkvh; kv_head++) {
+            auto q_head_group = q_normed->slice(1, kv_head, 1); // [1, 1, ngroup, ntok, dh]
+            auto k_head = k_for_attn->slice(1, kv_head, 1); // [1, 1, dh, total_len]
+            auto qk_head = qk_scores->slice(1, kv_head, 1); // [1, 1, ngroup, ntok, total_len]
+            
+            q_head_group = q_head_group->memShare({ngroup * ntok, dh});
+            k_head = k_head->memShare({dh, total_len});
+            qk_head = qk_head->memShare({ngroup * ntok, total_len});
+            
+            infiniopGemmDescriptor_t desc_qk_head;
+            RUN_INFINI(infiniopCreateGemmDescriptor(
+                rsrc.handle, &desc_qk_head, qk_head->desc(),
+                q_head_group->desc(), k_head->desc()));
+            
+            RUN_INFINI(infiniopGemm(desc_qk_head, workspace, workspace_size,
+                qk_head->data(), q_head_group->data(), k_head->data(),
+                scale, 0.0, rsrc.stream));
+                
+            infiniopDestroyGemmDescriptor(desc_qk_head);
+        }
+        
+        // Apply causal masking and softmax
+        infiniopCausalSoftmaxDescriptor_t desc_causal_softmax;
+        auto qk_flat = qk_scores->memShare({nkvh * ngroup * ntok, total_len});
+        RUN_INFINI(infiniopCreateCausalSoftmaxDescriptor(
+            rsrc.handle, &desc_causal_softmax, qk_flat->desc(), qk_flat->desc()));
+        
+        RUN_INFINI(infiniopCausalSoftmax(desc_causal_softmax, workspace, workspace_size,
+            qk_flat->data(), qk_flat->data(), rsrc.stream));
+        
+        // Compute attention @ V
+        auto v_for_attn = cache_v_current->slice(0, 0, total_len)->memShare({1, nkvh, total_len, dh});
+        auto attn_output = Tensor::buffer(dt_logits, {1, nkvh, ngroup, ntok, dh}, rsrc.memory_pool);
+        
+        for (uint32_t kv_head = 0; kv_head < nkvh; kv_head++) {
+            auto qk_head = qk_scores->slice(1, kv_head, 1)->memShare({ngroup * ntok, total_len});
+            auto v_head = v_for_attn->slice(1, kv_head, 1)->memShare({total_len, dh});
+            auto out_head = attn_output->slice(1, kv_head, 1)->memShare({ngroup * ntok, dh});
+            
+            infiniopGemmDescriptor_t desc_attn_v;
+            RUN_INFINI(infiniopCreateGemmDescriptor(
+                rsrc.handle, &desc_attn_v, out_head->desc(),
+                qk_head->desc(), v_head->desc()));
+            
+            RUN_INFINI(infiniopGemm(desc_attn_v, workspace, workspace_size,
+                out_head->data(), qk_head->data(), v_head->data(),
+                1.0, 0.0, rsrc.stream));
+                
+            infiniopDestroyGemmDescriptor(desc_attn_v);
+        }
+        
+        // Reshape attention output back to [1, ntok, nh, dh] and copy to o_buf
+        attn_output = attn_output->permute({0, 3, 1, 2, 4})->memShare({1, ntok, nh * dh});
+        RUN_INFINI(infinirtMemcpyAsync(o_buf->data(), attn_output->data(),
+            ntok * nh * dh * dsize(dt_logits), INFINIRT_MEMCPY_D2D, rsrc.stream));
+        
+        infiniopDestroyCausalSoftmaxDescriptor(desc_causal_softmax);
 
         // 6. Attention output projection
         RUN_INFINI(infiniopGemm(
@@ -389,12 +505,49 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
         logits_buf->data(), logits_out->data(),
         rsrc.w_out_embd->data(), 1.0, 0.0, rsrc.stream));
 
-    // TODO: Implement sampling logic for next token generation
-    // This would include:
-    // - Apply temperature scaling
-    // - Top-k and top-p filtering  
-    // - Multinomial sampling or greedy selection
-    // - Return output tokens
+    // Sampling logic for next token generation
+    auto last_token_logits = logits_buf->slice(1, ntok - 1, 1); // Get logits for last token
+    auto next_tokens = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
+    
+    // For each request, apply sampling
+    for (uint32_t req = 0; req < nreq; req++) {
+        auto req_logits = last_token_logits->slice(0, req, 1)->memShare({dvoc});
+        
+        // Create sampling descriptor for this request
+        infiniopRandomSampleDescriptor_t desc_sample;
+        auto sample_result = Tensor::buffer(INFINI_DTYPE_I64, {1}, rsrc.memory_pool);
+        
+        RUN_INFINI(infiniopCreateRandomSampleDescriptor(
+            rsrc.handle, &desc_sample, sample_result->desc(), req_logits->desc()));
+        
+        // Generate random value for sampling
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+        float random_val = dis(gen);
+        
+        // Perform sampling with parameters: random_val, topp, topk, temperature, stream
+        RUN_INFINI(infiniopRandomSample(desc_sample, workspace, workspace_size,
+            sample_result->data(), req_logits->data(), 
+            random_val, topp[req], static_cast<int>(topk[req]), temperature[req], rsrc.stream));
+        
+        // Copy result to output
+        RUN_INFINI(infinirtMemcpyAsync(&output[req], sample_result->data(),
+            sizeof(uint32_t), INFINIRT_MEMCPY_D2H, rsrc.stream));
+        
+        infiniopDestroyRandomSampleDescriptor(desc_sample);
+    }
+    
+    // Synchronize to ensure all operations complete
+    RUN_INFINI(infinirtStreamSynchronize(rsrc.stream));
+    
+    // Cleanup per-head RMS norm descriptors
+    for (uint32_t head = 0; head < nh; head++) {
+        infiniopDestroyRMSNormDescriptor(desc_norm_q_heads[head]);
+    }
+    for (uint32_t head = 0; head < nkvh; head++) {
+        infiniopDestroyRMSNormDescriptor(desc_norm_k_heads[head]);
+    }
 }
 
 Qwen3Model::Qwen3Model(const Qwen3Meta *meta, const Qwen3Weights *weights,
