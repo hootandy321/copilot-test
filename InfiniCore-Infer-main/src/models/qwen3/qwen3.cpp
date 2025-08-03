@@ -41,9 +41,6 @@ void createDeviceResource(DeviceResource *rsrc, const Qwen3Meta *meta,
             getFFNDown(meta, weights, layer, idev, ndev));
     }
 
-    // Create RoPE tables for Qwen3
-    auto rope_tables = getRoPETable(meta, device);
-
     auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
 
     *rsrc = DeviceResource{
@@ -53,8 +50,8 @@ void createDeviceResource(DeviceResource *rsrc, const Qwen3Meta *meta,
         getInEmbd(meta, weights),
         getOutNorm(meta, weights),
         getOutEmbd(meta, weights),
-        rope_tables.first,   // sin_table
-        rope_tables.second,  // cos_table
+        getSinTable(meta),
+        getCosTable(meta),
         w_attn_norm,
         w_attn_qkv,
         b_attn_qkv,
@@ -130,11 +127,8 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
     auto ngroup = nh / nkvh;
     auto idev = rsrc.device_id;
 
-    // Create input tensors
-    auto tokens_buf = Tensor::buffer(INFINI_U32, {1, ntok}, rsrc.memory_pool);
-    tokens_buf->setData(const_cast<uint32_t *>(tokens));
-
-    auto pos_ids_buf = Tensor::buffer(INFINI_U32, {1, ntok}, rsrc.memory_pool);
+    // Create input tensors  
+    auto pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {1, ntok}, rsrc.memory_pool);
     auto hidden_states = Tensor::buffer(dt_logits, {1, ntok, d}, rsrc.memory_pool);
     auto logits_in = Tensor::buffer(dt_logits, {1, ntok, d}, rsrc.memory_pool);
     auto logits_out = Tensor::buffer(dt_logits, {1, ntok, d}, rsrc.memory_pool);
@@ -150,14 +144,15 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
         pos_offset += req_len;
     }
 
-    // Input embedding
-    infiniopEmbeddingDescriptor_t desc_embd;
-    RUN_INFINI(infiniopCreateEmbeddingDescriptor(
-        rsrc.handle, &desc_embd, hidden_states->desc(),
-        tokens_buf->desc(), rsrc.w_in_embd->desc()));
+    // Input embedding (using direct memory copy like jiuge)
+    for (uint32_t i = 0; i < ntok; i++) {
+        RUN_INFINI(infinirtMemcpyAsync(hidden_states->data(i * d),
+                                       rsrc.w_in_embd->data(tokens[i] * d),
+                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, rsrc.stream));
+    }
+
+    // Initialize workspace size calculation
     size_t workspace_size = 0, temp_size;
-    RUN_INFINI(infiniopGetEmbeddingWorkspaceSize(desc_embd, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
 
     // Process each layer
     for (size_t layer = 0; layer < nlayer; layer++) {
@@ -291,7 +286,7 @@ void inferDeviceBatch(const Qwen3Meta &meta, DeviceResource &rsrc,
     workspace_size = std::max(workspace_size, temp_size);
 
     // Sampling
-    auto workspace = Tensor::buffer(INFINI_U8, {workspace_size}, rsrc.memory_pool);
+    auto workspace = Tensor::buffer(INFINI_DTYPE_U8, {workspace_size}, rsrc.memory_pool);
     // [Implementation of sampling logic would continue here...]
 }
 
@@ -300,23 +295,26 @@ Qwen3Model::Qwen3Model(const Qwen3Meta *meta, const Qwen3Weights *weights,
     : meta(*meta), device(device), dev_ids(device_ids) {
     auto ndev = device_ids.size();
     dev_resources.resize(ndev);
-    states.resize(ndev);
+    states.reserve(ndev);
+    for (size_t i = 0; i < ndev; i++) {
+        states.push_back(std::make_unique<InferState>());
+    }
     threads.resize(ndev);
 
-    infinicclComm_t comm = nullptr;
+    auto comms = std::vector<infinicclComm_t>(ndev, nullptr);
     if (ndev > 1) {
-        infinicclCommInitRank(&comm, ndev, 0, device_ids.data());
+        RUN_INFINI(infinicclCommInitAll(device, comms.data(), ndev, device_ids.data()));
     }
 
     for (size_t i = 0; i < ndev; i++) {
         createDeviceResource(&dev_resources[i], meta, weights, device, i, ndev,
-                           device_ids[i], comm);
+                           device_ids[i], comms[i]);
     }
 
     // Start worker threads
     for (size_t i = 0; i < ndev; i++) {
-        threads[i] = std::thread([this, i]() {
-            auto &state = states[i];
+        threads[i] = std::thread([this, i, &meta = this->meta]() {
+            auto &state = *states[i];
             auto &rsrc = dev_resources[i];
             
             while (true) {
@@ -354,11 +352,11 @@ struct Qwen3Model *createQwen3Model(const Qwen3Meta *meta,
 void destroyQwen3Model(struct Qwen3Model *model) {
     if (model) {
         // Signal threads to exit
-        for (auto &state : model->states) {
-            std::lock_guard<std::mutex> lock(state.mtx);
-            state.exit_flag = true;
-            state.cv_load.notify_one();
-            state.cv_start.notify_one();
+        for (auto &state_ptr : model->states) {
+            std::lock_guard<std::mutex> lock(state_ptr->mtx);
+            state_ptr->exit_flag = true;
+            state_ptr->cv_load.notify_one();
+            state_ptr->cv_start.notify_one();
         }
 
         // Wait for threads to complete
@@ -377,31 +375,31 @@ void destroyQwen3Model(struct Qwen3Model *model) {
     }
 }
 
-void inferBatch(struct Qwen3Model *model,
-                const uint32_t *tokens, uint32_t ntok,
-                const uint32_t *req_lens, uint32_t nreq,
-                const uint32_t *req_pos, struct KVCache **kv_caches,
-                const float *temperature, const uint32_t *topk,
-                const float *topp, uint32_t *output) {
+void inferQwen3Batch(struct Qwen3Model *model,
+                     const uint32_t *tokens, uint32_t ntok,
+                     const uint32_t *req_lens, uint32_t nreq,
+                     const uint32_t *req_pos, struct KVCache **kv_caches,
+                     const float *temperature, const uint32_t *topk,
+                     const float *topp, uint32_t *output) {
     if (!model) return;
 
     model->req = {tokens, ntok, req_lens, nreq, req_pos, kv_caches,
                   temperature, topk, topp, output};
 
     // Signal all devices
-    for (auto &state : model->states) {
-        std::lock_guard<std::mutex> lock(state.mtx);
-        state.loaded = true;
-        state.proceed = true;
-        state.cv_load.notify_one();
-        state.cv_start.notify_one();
+    for (auto &state_ptr : model->states) {
+        std::lock_guard<std::mutex> lock(state_ptr->mtx);
+        state_ptr->loaded = true;
+        state_ptr->proceed = true;
+        state_ptr->cv_load.notify_one();
+        state_ptr->cv_start.notify_one();
     }
 
     // Wait for completion
-    for (auto &state : model->states) {
-        std::unique_lock<std::mutex> lock(state.mtx);
-        state.cv_done.wait(lock, [&state] { return !state.proceed; });
-        state.loaded = false;
+    for (auto &state_ptr : model->states) {
+        std::unique_lock<std::mutex> lock(state_ptr->mtx);
+        state_ptr->cv_done.wait(lock, [&state_ptr] { return !state_ptr->proceed; });
+        state_ptr->loaded = false;
     }
 }
 

@@ -2,6 +2,7 @@
 #define QWEN3_WEIGHT_HPP
 
 #include "qwen3_impl.hpp"
+#include "../../utils.hpp"
 
 #include <cmath>
 
@@ -130,34 +131,59 @@ inline std::shared_ptr<Tensor> getFFNDown(
     }
 }
 
-// Qwen3 specific helper functions for RoPE
-inline std::pair<std::shared_ptr<Tensor>, std::shared_ptr<Tensor>> 
-getRoPETable(Qwen3Meta const *meta, infiniDevice_t device) {
-    auto dctx = meta->dctx;
-    auto dh = meta->dh;
-    auto theta = meta->theta;
-    
-    std::vector<float> sin_data(dctx * dh);
-    std::vector<float> cos_data(dctx * dh);
-    
-    for (size_t pos = 0; pos < dctx; ++pos) {
-        for (size_t i = 0; i < dh / 2; ++i) {
-            float freq = 1.0f / std::pow(theta, (float)(2 * i) / dh);
-            float angle = pos * freq;
-            sin_data[pos * dh + i] = std::sin(angle);
-            sin_data[pos * dh + i + dh / 2] = std::sin(angle);
-            cos_data[pos * dh + i] = std::cos(angle);
-            cos_data[pos * dh + i + dh / 2] = std::cos(angle);
+// Qwen3 specific helper functions for RoPE (following jiuge pattern)
+inline std::shared_ptr<Tensor> getSinTable(Qwen3Meta const *meta) {
+    auto half_dh = meta->dh / 2;
+    auto unit = dsize(meta->dt_logits);
+    void *table = std::malloc(meta->dctx * half_dh * unit);
+
+    for (size_t i = 0; i < meta->dctx; i++) {
+        for (size_t j = 0; j < half_dh; j++) {
+            float _sin = std::sin(
+                static_cast<float>(i) / std::pow(meta->theta, static_cast<float>(j) / half_dh));
+            if (meta->dt_logits == INFINI_DTYPE_F16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_sin);
+            } else if (meta->dt_logits == INFINI_DTYPE_BF16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_bf16(_sin);
+            } else if (meta->dt_logits == INFINI_DTYPE_F32) {
+                ((float *)table)[i * half_dh + j] = _sin;
+            } else {
+                std::cout << "unsupported data type" << std::endl;
+                exit(1);
+            }
         }
     }
-    
-    auto sin_shape = std::vector<size_t>({dctx, dh});
-    auto cos_shape = std::vector<size_t>({dctx, dh});
-    
-    auto sin_tensor = Tensor::weight((char*)sin_data.data(), INFINI_F32, sin_shape);
-    auto cos_tensor = Tensor::weight((char*)cos_data.data(), INFINI_F32, cos_shape);
-    
-    return {sin_tensor, cos_tensor};
+    auto shape = std::vector<size_t>({meta->dctx, half_dh});
+    auto tensor = Tensor::weight(table, meta->dt_logits, shape);
+    std::free(table);
+    return tensor;
+}
+
+inline std::shared_ptr<Tensor> getCosTable(Qwen3Meta const *meta) {
+    auto half_dh = meta->dh / 2;
+    auto unit = dsize(meta->dt_logits);
+    void *table = std::malloc(meta->dctx * half_dh * unit);
+
+    for (size_t i = 0; i < meta->dctx; i++) {
+        for (size_t j = 0; j < half_dh; j++) {
+            float _cos = std::cos(
+                static_cast<float>(i) / std::pow(meta->theta, static_cast<float>(j) / half_dh));
+            if (meta->dt_logits == INFINI_DTYPE_F16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_cos);
+            } else if (meta->dt_logits == INFINI_DTYPE_BF16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_bf16(_cos);
+            } else if (meta->dt_logits == INFINI_DTYPE_F32) {
+                ((float *)table)[i * half_dh + j] = _cos;
+            } else {
+                std::cout << "unsupported data type" << std::endl;
+                exit(1);
+            }
+        }
+    }
+    auto shape = std::vector<size_t>({meta->dctx, half_dh});
+    auto tensor = Tensor::weight(table, meta->dt_logits, shape);
+    std::free(table);
+    return tensor;
 }
 
 #endif

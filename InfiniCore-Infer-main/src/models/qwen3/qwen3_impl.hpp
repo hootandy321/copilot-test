@@ -36,6 +36,13 @@ struct InferState {
     bool loaded = false;
     bool proceed = false;
     bool exit_flag = false;
+    
+    // Make it movable
+    InferState() = default;
+    InferState(const InferState&) = delete;
+    InferState& operator=(const InferState&) = delete;
+    InferState(InferState&&) = default;
+    InferState& operator=(InferState&&) = default;
 };
 
 struct InferRequest {
@@ -56,7 +63,7 @@ struct Qwen3Model {
     infiniDevice_t device;
     std::vector<int> dev_ids;
     std::vector<DeviceResource> dev_resources;
-    std::vector<InferState> states;
+    std::vector<std::unique_ptr<InferState>> states;
     std::vector<std::thread> threads;
     InferRequest req;
 

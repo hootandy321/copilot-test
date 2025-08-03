@@ -1,6 +1,6 @@
 #include "qwen3_impl.hpp"
 
-__C struct KVCache *createKVCache(const Qwen3Model *model) {
+__C struct KVCache *createQwen3KVCache(const Qwen3Model *model) {
     KVCache *cache = new KVCache();
     auto ndev = model->dev_resources.size();
     auto nkvh = model->meta.nkvh / ndev;
@@ -22,10 +22,10 @@ __C struct KVCache *createKVCache(const Qwen3Model *model) {
     return cache;
 }
 
-__C struct KVCache *duplicateKVCache(const Qwen3Model *model,
-                                     const KVCache *kv_cache,
-                                     unsigned int seq_len) {
-    auto new_kv_cache = createKVCache(model);
+__C struct KVCache *duplicateQwen3KVCache(const Qwen3Model *model,
+                                          const KVCache *kv_cache,
+                                          unsigned int seq_len) {
+    auto new_kv_cache = createQwen3KVCache(model);
     auto ndev = model->dev_resources.size();
     auto nkvh = model->meta.nkvh / ndev;
     auto dh = model->meta.dh;
@@ -46,7 +46,7 @@ __C struct KVCache *duplicateKVCache(const Qwen3Model *model,
     return new_kv_cache;
 }
 
-__C void dropKVCache(Qwen3Model const *model, KVCache *kv_cache) {
+__C void dropQwen3KVCache(Qwen3Model const *model, KVCache *kv_cache) {
     auto ndev = model->dev_resources.size();
     for (unsigned int idev = 0; idev < ndev; idev++) {
         RUN_INFINI(infinirtSetDevice(model->device, model->dev_ids[idev]));

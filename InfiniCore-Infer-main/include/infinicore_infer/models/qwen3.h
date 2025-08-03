@@ -69,17 +69,17 @@ destroyQwen3Model(struct Qwen3Model *);
 
 /// @brief 创建 KV Cache
 __C __export struct KVCache *
-createKVCache(const struct Qwen3Model *);
+createQwen3KVCache(const struct Qwen3Model *);
 
 /// @brief 复制 KV Cache
 __C __export struct KVCache *
-duplicateKVCache(const struct Qwen3Model *,
-                 const struct KVCache *, uint32_t seq_len);
+duplicateQwen3KVCache(const struct Qwen3Model *,
+                      const struct KVCache *, uint32_t seq_len);
 
 /// @brief 销毁 KV Cache
 __C __export void
-dropKVCache(const struct Qwen3Model *,
-            struct KVCache *);
+dropQwen3KVCache(const struct Qwen3Model *,
+                 struct KVCache *);
 
 /// @brief 批次推理一轮
 /// @param tokens 输入 token 地址
@@ -93,11 +93,11 @@ dropKVCache(const struct Qwen3Model *,
 /// @param topp 采样 topp
 /// @param output 输出 token 数组，每个请求一个输出，长度至少为nreq
 __C __export void
-inferBatch(struct Qwen3Model *,
-           const uint32_t *tokens, uint32_t ntok,
-           const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
-           struct KVCache **kv_caches,
-           const float *temperature, const uint32_t *topk, const float *topp,
-           uint32_t *output);
+inferQwen3Batch(struct Qwen3Model *,
+                const uint32_t *tokens, uint32_t ntok,
+                const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                struct KVCache **kv_caches,
+                const float *temperature, const uint32_t *topk, const float *topp,
+                uint32_t *output);
 
 #endif
