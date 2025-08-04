@@ -355,50 +355,162 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                                        dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
     }
 
+    /*
+     * InfiniCore Operator Descriptor Creation and Workspace Size Calculation
+     * 
+     * This section creates descriptors for all compute operations needed in the inference pipeline.
+     * Descriptors define the operation parameters, tensor shapes, and algorithms to use.
+     * InfiniCore will use these descriptors to:
+     * 1. Optimize kernel selection based on hardware capabilities
+     * 2. Calculate required workspace memory for temporary computations
+     * 3. Enable efficient operator reuse across multiple calls
+     * 
+     * The workspace size is calculated as the maximum across all operations to ensure
+     * a single allocation can handle any intermediate computation.
+     */
     // Prepare operators and workspace
     size_t workspace_size = 0, temp_size = 0;
-    // attn & mlp rmsnorm
+    
+    /*
+     * RMS Normalization Descriptor for Attention and FFN Layers
+     * 
+     * RMSNorm formula: y = x / √(mean(x²) + ε) * γ
+     * Where γ is the learned scale parameter (weight)
+     * 
+     * Input/Output shapes: [ntok, d] -> [ntok, d]
+     * Weight shape: [d]
+     * 
+     * This descriptor is reused for all layer normalizations in the model.
+     */
     infiniopRMSNormDescriptor_t desc_norm;
     RUN_INFINI(infiniopCreateRMSNormDescriptor(
-        rsrc.handle, &desc_norm, logits_in->desc(),
-        logits_out->desc(), rsrc.w_attn_norm[0]->desc(),
-        meta.epsilon));
+        rsrc.handle, &desc_norm, logits_in->desc(),     // Input: [ntok, d]
+        logits_out->desc(), rsrc.w_attn_norm[0]->desc(), // Output: [ntok, d], Weight: [d]
+        meta.epsilon));                                   // Normalization epsilon
     RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm, &workspace_size));
     workspace_size = std::max(workspace_size, temp_size);
-    // Attention
+    /*
+     * Attention Mechanism Descriptors
+     * 
+     * The attention computation involves several matrix operations:
+     * 1. QKV projection: X -> Q, K, V via matrix multiplication
+     * 2. RoPE position encoding on Q and K  
+     * 3. Attention computation: softmax(QK^T/√d_k) * V
+     * 4. Output projection: O -> final attention output
+     */
+    
+    // GEMM descriptors for QKV projection and attention output
     infiniopGemmDescriptor_t desc_attn_qkv, desc_attn_o;
     infiniopRearrangeDescriptor_t desc_qkv_bias;
+    
+    // QKV bias addition if present (optional operation)
     if (has_qkv_bias) {
+        // Rearrange/broadcast bias to match QKV buffer shape
+        // Bias shape: [(nh + 2*nkvh)/ndev * dh] -> [ntok, (nh + 2*nkvh)/ndev * dh]
         RUN_INFINI(infiniopCreateRearrangeDescriptor(
             rsrc.handle, &desc_qkv_bias, qkv_buf->desc(),
             TensorDesc::create(dt_logits, {ntok, (nh + nkvh * 2) * dh}, {0, 1})->desc()));
     }
+    
+    /*
+     * QKV Projection GEMM: logits_in * w_attn_qkv -> qkv_buf
+     * 
+     * Matrix multiplication: Y = X * W  
+     * Input X: [ntok, d] - normalized hidden states
+     * Weight W: [d, (nh + 2*nkvh)/ndev * dh] - QKV projection weights  
+     * Output Y: [ntok, (nh + 2*nkvh)/ndev * dh] - concatenated Q, K, V projections
+     * 
+     * The output contains Q, K, V projections concatenated along the last dimension:
+     * - Q: [ntok, nh/ndev * dh]      (query projections)
+     * - K: [ntok, nkvh/ndev * dh]    (key projections)  
+     * - V: [ntok, nkvh/ndev * dh]    (value projections)
+     */
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_attn_qkv, qkv_buf->desc(),
         logits_in->desc(), rsrc.w_attn_qkv[0]->desc()));
+        
+    /*
+     * Attention Output Projection GEMM: o_buf * w_attn_out -> logits_in
+     * 
+     * Matrix multiplication: Y = X * W
+     * Input X: [ntok, nh/ndev * dh] - attention output from all heads on this device
+     * Weight W: [nh/ndev * dh, d] - output projection weights
+     * Output Y: [ntok, d] - projected attention output (will be accumulated across devices)
+     */
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_attn_o, logits_in->desc(),
         o_buf->desc(), rsrc.w_attn_out[0]->desc()));
+        
+    // Calculate workspace requirements for both GEMM operations
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_qkv, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_o, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
+    /*
+     * RoPE (Rotary Position Embedding) Descriptors
+     * 
+     * RoPE applies rotational position encoding to query and key vectors:
+     * For each position pos and dimension pair (i, i+d/2):
+     * q'[i] = q[i] * cos(pos/θ^(i/d)) - q[i+d/2] * sin(pos/θ^(i/d))
+     * q'[i+d/2] = q[i] * sin(pos/θ^(i/d)) + q[i+d/2] * cos(pos/θ^(i/d))
+     * 
+     * This encoding allows the model to understand relative positions between tokens.
+     */
     infiniopRoPEDescriptor_t desc_rope_q, desc_rope_k;
-    qkv_buf->dimSplit(1, {nh + nkvh * 2, dh}); // (ntok, nh + 2 * nkvh, dh)
-    auto qkv_buf_q = qkv_buf->slice(1, 0, nh);
-    auto qkv_buf_k = qkv_buf->slice(1, nh, nkvh);
+    
+    // Split QKV buffer to access Q and K separately
+    // qkv_buf shape: [ntok, (nh + 2*nkvh) * dh] -> [ntok, nh + 2*nkvh, dh]
+    qkv_buf->dimSplit(1, {nh + nkvh * 2, dh}); 
+    
+    // Extract query and key projections from concatenated QKV buffer
+    auto qkv_buf_q = qkv_buf->slice(1, 0, nh);           // Q: [ntok, nh, dh]
+    auto qkv_buf_k = qkv_buf->slice(1, nh, nkvh);        // K: [ntok, nkvh, dh]
+    
+    /*
+     * RoPE descriptor for Query vectors
+     * 
+     * Applies position encoding to queries based on position IDs and precomputed sin/cos tables
+     * Input/Output: [ntok, nh, dh] -> [ntok, nh, dh]
+     * Position IDs: [ntok] - position of each token in its sequence
+     * Sin/Cos tables: [dctx, dh/2] - precomputed trigonometric values
+     */
     RUN_INFINI(infiniopCreateRoPEDescriptor(
         rsrc.handle, &desc_rope_q, qkv_buf_q->desc(), qkv_buf_q->desc(),
         pos_ids_buf->desc(), rsrc.sin_table->desc(),
         rsrc.cos_table->desc()));
     RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_q, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
+    
+    /*
+     * RoPE descriptor for Key vectors
+     * 
+     * Applies the same position encoding to keys
+     * Input/Output: [ntok, nkvh, dh] -> [ntok, nkvh, dh]
+     */
     RUN_INFINI(infiniopCreateRoPEDescriptor(
         rsrc.handle, &desc_rope_k, qkv_buf_k->desc(), qkv_buf_k->desc(),
         pos_ids_buf->desc(), rsrc.sin_table->desc(),
         rsrc.cos_table->desc()));
     RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_k, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
+    /*
+     * Per-Request Attention Inner Loop Descriptors
+     * 
+     * Since each request in the batch may have different sequence lengths and KV cache states,
+     * we need separate descriptors for each request's attention computation.
+     * 
+     * The attention mechanism for each request involves:
+     * 1. Rearranging Q and K for grouped-query attention (GQA)
+     * 2. Computing attention scores: QK^T (scaled dot-product attention)
+     * 3. Applying causal softmax with masking
+     * 4. Computing attention output: attention_weights * V
+     * 5. Rearranging output back to standard format
+     * 
+     * Key optimizations:
+     * - Grouped Query Attention: Multiple query heads can share KV heads (ngroup = nh/nkvh)
+     * - KV caching: Past key-value pairs are stored and reused
+     * - Causal masking: Future tokens cannot attend to past tokens
+     */
     // attention inner
     auto desc_kv_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
     auto desc_q_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
@@ -406,37 +518,98 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto desc_qk_softmaxs = std::vector<infiniopCausalSoftmaxDescriptor_t>(nreq);
     auto desc_attn_v_gemms = std::vector<infiniopGemmDescriptor_t>(nreq);
     auto desc_attn_v_rearranges = std::vector<infiniopRearrangeDescriptor_t>(nreq);
-    size_t token_offset = 0;
-    size_t max_qk_size = 0;
-    size_t max_seq_len = 0;
+    
+    size_t token_offset = 0;   // Track position in batch for current request
+    size_t max_qk_size = 0;    // Maximum QK matrix size for buffer allocation
+    size_t max_seq_len = 0;    // Maximum sequence length for buffer allocation
+    
+    // Prepare output buffer for attention heads: [ntok, nh, dh]
     o_buf->dimSplit(1, {nh, dh});
+    /*
+     * Create Descriptors for Each Request's Attention Computation
+     * 
+     * Each request may have different sequence lengths and past KV cache lengths,
+     * requiring individual descriptors for optimal memory layout and computation.
+     */
     for (uint32_t req = 0; req < nreq; req++) {
-        auto past_len = req_pos[req];
-        auto seq_len = req_lens[req];
-        auto total_len = past_len + seq_len;
+        auto past_len = req_pos[req];        // Number of tokens already in KV cache
+        auto seq_len = req_lens[req];        // Current sequence length to process
+        auto total_len = past_len + seq_len; // Total sequence length in KV cache
+        
+        /*
+         * Extract per-request tensor slices from batch tensors
+         * 
+         * Tensor shapes for this request:
+         * - o: [seq_len, nh, dh] - attention output for this request
+         * - q: [seq_len, nh, dh] - query vectors for this request  
+         * - k: [seq_len, nkvh, dh] - key vectors for this request
+         * - v: [seq_len, nkvh, dh] - value vectors for this request (used later)
+         */
         auto o = o_buf->slice({{0, token_offset, seq_len}});
         auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
         auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
         // auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
+        
+        /*
+         * KV Cache Tensor Configuration
+         * 
+         * KV cache stores past key-value pairs for efficient autoregressive generation.
+         * Shape: [total_len, nkvh, dh] stored as [nkvh, dh, total_len] in memory
+         * 
+         * full_kv: Complete KV cache including past + current tokens [nkvh, dh, total_len]
+         * cache_kv: Slice for storing current keys/values [nkvh, dh, seq_len]
+         */
         // kv cache tensors can share the same descriptor
         // [nkvh, dh, total_len]
         auto full_kv = kv_caches[req]->k[idev][0]->slice(0, 0, total_len)->permute({1, 2, 0});
         auto cache_kv = kv_caches[req]->k[idev][0]->slice(0, past_len, seq_len);
 
+        /*
+         * KV Rearrange Descriptor: Store current K/V in cache
+         * 
+         * Transforms current keys/values to cache storage format:
+         * k: [seq_len, nkvh, dh] -> cache_kv: [seq_len, nkvh, dh] (different memory layout)
+         */
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_kv_rearranges[req],
                                                      cache_kv->desc(), k->desc()));
 
+        /*
+         * Query Rearrange for Grouped Query Attention (GQA)
+         * 
+         * Reshape queries to enable efficient GQA computation:
+         * q: [seq_len, nh, dh] -> [seq_len, nkvh, ngroup, dh] -> [nkvh, ngroup, seq_len, dh]
+         * 
+         * This layout allows each KV head to attend to multiple query heads (ngroup heads per KV head)
+         */
         // [nkvh, ngroup, seq_len, dh]
         q->dimSplit(1, {nkvh, ngroup})->permute({1, 2, 0, 3});
         auto q_t = TensorDesc::create(dt_logits, {nkvh, ngroup, seq_len, dh});
         // [seq_len, nkvh, ngroup, dh] -> [nkvh, ngroup, seq_len, dh]
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_q_rearranges[req],
                                                      q_t->desc(), q->desc()));
+        
+        /*
+         * Attention Value Rearrange Descriptor
+         * 
+         * After computing attention weights * values, rearrange back to standard format:
+         * [nkvh, ngroup, seq_len, dh] -> [seq_len, nkvh, ngroup, dh] -> [seq_len, nh, dh]
+         */
         // [nkvh, ngroup, seq_len, dh] -> [seq_len, nkvh, ngroup, dh]
         auto attn_v_t = q_t;
         auto attn_v = TensorDesc::createWithOrder(dt_logits, {nkvh, ngroup, seq_len, dh}, {1, 2, 0, 3});
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_attn_v_rearranges[req],
                                                      attn_v->desc(), attn_v_t->desc()));
+        
+        /*
+         * QK Attention Score Computation: Q * K^T / √d_k
+         * 
+         * Matrix multiplication to compute attention scores:
+         * Q: [nkvh, ngroup * seq_len, dh] (reshaped for batched computation)
+         * K^T: [nkvh, dh, total_len] (full KV cache transposed)
+         * QK: [nkvh, ngroup * seq_len, total_len] (attention scores before softmax)
+         * 
+         * The scaling factor 1/√d_k is applied later during the GEMM operation.
+         */
         q_t = TensorDesc::create(dt_logits, {nkvh, ngroup * seq_len, dh});
         auto qk = TensorDesc::create(dt_logits, {nkvh, ngroup * seq_len, total_len});
         max_qk_size = std::max(max_qk_size, size_t(seq_len * total_len));
@@ -446,6 +619,14 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_qk_gemms[req], &temp_size));
         workspace_size = std::max(workspace_size, temp_size);
 
+        /*
+         * Attention Value Computation: attention_weights * V
+         * 
+         * Matrix multiplication with attention-weighted values:
+         * attention_weights: [nkvh, ngroup * seq_len, total_len] (after softmax)
+         * V: [nkvh, total_len, dh] (full value cache)
+         * output: [nkvh, ngroup * seq_len, dh] (attention output)
+         */
         // [nkvh, total_len, dh]
         auto full_v = kv_caches[req]->v[idev][0]->slice(0, 0, total_len)->permute({1, 0, 2});
         RUN_INFINI(infiniopCreateGemmDescriptor(
@@ -453,6 +634,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_v_gemms[req], &temp_size));
         workspace_size = std::max(workspace_size, temp_size);
 
+        /*
+         * Causal Softmax with Attention Masking
+         * 
+         * Applies softmax to attention scores with causal masking (lower triangular).
+         * Shape: [nkvh * ngroup, seq_len, total_len]
+         * 
+         * Causal mask ensures each token can only attend to previous tokens and itself,
+         * preventing information leakage from future tokens during autoregressive generation.
+         */
         qk = TensorDesc::create(dt_logits, {nkvh * ngroup, seq_len, total_len});
         RUN_INFINI(infiniopCreateCausalSoftmaxDescriptor(
             rsrc.handle, &desc_qk_softmaxs[req], qk->desc(), qk->desc()));
@@ -461,24 +651,86 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         token_offset += seq_len;
     }
+    /*
+     * Allocate Attention Intermediate Buffers
+     * 
+     * These buffers store intermediate results during attention computation.
+     * Sizes are based on maximum requirements across all requests in the batch.
+     * 
+     * Buffer shapes:
+     * - qk_buf: [nh, max_qk_size] - attention scores (QK^T) for largest request
+     * - rearrange_q_buf: [nkvh, ngroup * max_seq_len, dh] - rearranged queries
+     * - attn_val_buf: [nh, max_seq_len, dh] - attention output values
+     */
     auto qk_buf = Tensor::buffer(dt_logits, {nh, max_qk_size}, rsrc.memory_pool);
     auto rearrange_q_buf = Tensor::buffer(dt_logits, {nkvh, ngroup * max_seq_len, dh}, rsrc.memory_pool);
     auto attn_val_buf = Tensor::buffer(dt_logits, {nh, max_seq_len, dh}, rsrc.memory_pool);
 
+    /*
+     * Feed-Forward Network (FFN) Descriptors
+     * 
+     * The FFN block implements the SwiGLU activation function:
+     * FFN(x) = (Swish(x * W_gate) ⊙ (x * W_up)) * W_down
+     * Where Swish(x) = x * sigmoid(x) and ⊙ is element-wise multiplication
+     * 
+     * This involves three matrix multiplications:
+     * 1. Gate & Up projections: x -> [gate, up] (computed together)
+     * 2. SwiGLU activation: gate * swish(up) 
+     * 3. Down projection: activated -> output
+     */
     // MLP descriptors
     infiniopGemmDescriptor_t desc_ffn_gate_up, desc_ffn_down;
     infiniopSwiGLUDescriptor_t desc_swiglu;
+    
+    /*
+     * FFN Gate & Up Projection GEMM: logits_out * w_ffn_gate_up -> gate_up_buf
+     * 
+     * Matrix multiplication: Y = X * W
+     * Input X: [ntok, d] - normalized hidden states from attention
+     * Weight W: [d, 2*di/ndev] - concatenated gate and up projection weights
+     * Output Y: [ntok, 2*di/ndev] - gate and up projections concatenated
+     * 
+     * The output contains both gate and up projections:
+     * - gate: [ntok, di/ndev] - gating values for SwiGLU
+     * - up: [ntok, di/ndev] - up-projected values for SwiGLU
+     */
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_ffn_gate_up, gate_up_buf->desc(),
         logits_out->desc(), rsrc.w_ffn_gate_up[0]->desc()));
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_ffn_gate_up, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
-    auto gate_buf = gate_up_buf->slice(1, 0, di);
-    auto up_buf = gate_up_buf->slice(1, di, di);
+    
+    // Split gate_up_buf into gate and up components for SwiGLU
+    auto gate_buf = gate_up_buf->slice(1, 0, di);      // Gate: [ntok, di/ndev]
+    auto up_buf = gate_up_buf->slice(1, di, di);       // Up: [ntok, di/ndev]
+    
+    /*
+     * SwiGLU Activation Function
+     * 
+     * Computes: output = gate * swish(up) = gate * (up * sigmoid(up))
+     * Input gate: [ntok, di/ndev] - gating values
+     * Input up: [ntok, di/ndev] - values to be gated
+     * Output: [ntok, di/ndev] - activated values (stored back in gate_buf)
+     * 
+     * SwiGLU provides better performance than standard ReLU activations
+     * in transformer FFN blocks by using learnable gating mechanisms.
+     */
     RUN_INFINI(infiniopCreateSwiGLUDescriptor(
         rsrc.handle, &desc_swiglu, gate_buf->desc(), up_buf->desc(), gate_buf->desc()));
     RUN_INFINI(infiniopGetSwiGLUWorkspaceSize(desc_swiglu, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
+    
+    /*
+     * FFN Down Projection GEMM: gate_buf * w_ffn_down -> logits_in
+     * 
+     * Matrix multiplication: Y = X * W  
+     * Input X: [ntok, di/ndev] - activated values from SwiGLU
+     * Weight W: [di/ndev, d] - down projection weights
+     * Output Y: [ntok, d] - projected back to model dimension
+     * 
+     * This completes the FFN computation and the result will be added
+     * to the residual connection from the attention block.
+     */
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_ffn_down, logits_in->desc(),
         gate_buf->desc(), rsrc.w_ffn_down[0]->desc()));
