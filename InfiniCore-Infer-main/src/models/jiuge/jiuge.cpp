@@ -1,3 +1,14 @@
+/*
+ * Jiuge Model Implementation - InfiniCore Inference Engine
+ * 
+ * This file implements the core inference logic for the Jiuge transformer model
+ * using InfiniCore's high-performance computing APIs. It handles:
+ * - Multi-device distributed inference with tensor parallelism
+ * - Memory-efficient attention mechanism with KV-caching
+ * - Optimized matrix operations and tensor transformations
+ * - Asynchronous execution with proper synchronization
+ */
+
 #include "jiuge_impl.hpp"
 #include "jiuge_weight.hpp"
 
@@ -9,107 +20,238 @@
 #include <thread>
 #include <vector>
 
+/*
+ * Device Resource Creation and Initialization
+ * 
+ * Creates and initializes all GPU/device resources needed for inference including:
+ * - InfiniCore device context and operation handles
+ * - Distributed tensor weights for multi-device parallelism
+ * - Memory pools for efficient buffer management
+ * - Communication contexts for inter-device synchronization
+ * 
+ * Parameters:
+ * - rsrc: Output device resource structure to populate
+ * - meta: Model metadata (layers, dimensions, data types)
+ * - weights: Model weight tensors
+ * - device: InfiniCore device type (GPU/CPU)
+ * - idev: Current device index in distributed setup (0 to ndev-1)
+ * - ndev: Total number of devices for tensor parallelism
+ * - dev_id: Physical device ID
+ * - comm: InfiniCCL communicator for multi-device operations
+ */
 void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
                           infiniDevice_t device, int idev,
                           int ndev, int dev_id,
                           infinicclComm_t comm) {
+    // Initialize InfiniCore device context and create operation handle
+    // This sets the active device for subsequent InfiniCore API calls
     RUN_INFINI(infinirtSetDevice(device, dev_id));
+    
+    // Create operation handle for this device - used for all compute operations
     infiniopHandle_t handle;
     infiniopCreateHandle(&handle);
+    
+    // Create execution stream for asynchronous operations
     infinirtStream_t stream;
     infinirtStreamCreate(&stream);
 
+    /*
+     * Weight Tensor Extraction for Distributed Inference
+     * 
+     * Extract model weights from global weight storage and partition them
+     * across devices for tensor parallelism. Each device gets a slice of:
+     * - Attention projection weights (QKV, output): partitioned by attention heads
+     * - FFN weights: partitioned by intermediate dimension
+     * - Normalization weights: replicated across all devices
+     * 
+     * Tensor shapes:
+     * - w_attn_norm: [d] - layer normalization weights, replicated
+     * - w_attn_qkv: [d, (nh + 2*nkvh)/ndev * dh] - QKV projection, head-partitioned  
+     * - b_attn_qkv: [(nh + 2*nkvh)/ndev * dh] - QKV bias (optional), head-partitioned
+     * - w_attn_out: [nh/ndev * dh, d] - output projection, head-partitioned
+     * - w_ffn_norm: [d] - FFN normalization weights, replicated
+     * - w_ffn_gate_up: [d, 2*di/ndev] - gate & up projections, dim-partitioned
+     * - w_ffn_down: [di/ndev, d] - down projection, dim-partitioned
+     */
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
     for (size_t layer = 0; layer < meta->nlayer; layer++) {
+        // Extract attention normalization weights [d] - same on all devices
         w_attn_norm.push_back(
             getAttnNorm(meta, weights, layer));
+        
+        // Extract QKV projection weights [d, (nh + 2*nkvh)/ndev * dh] 
+        // Partitioned by attention heads across devices
         w_attn_qkv.push_back(
             getAttnQKV(meta, weights, layer, idev, ndev));
+        
+        // Extract QKV bias if present [(nh + 2*nkvh)/ndev * dh]
         if (weights->attn_qkv_b != nullptr) {
             b_attn_qkv.push_back(
                 getAttnQKVBias(meta, weights, layer, idev, ndev));
         }
+        
+        // Extract attention output projection [nh/ndev * dh, d]
+        // Partitioned by input dimension (attention heads)
         w_attn_out.push_back(
             getAttnO(meta, weights, layer, idev, ndev));
+            
+        // Extract FFN normalization weights [d] - same on all devices  
         w_ffn_norm.push_back(
             getFFNNorm(meta, weights, layer));
+            
+        // Extract FFN gate & up projections [d, 2*di/ndev]
+        // Partitioned by intermediate dimension across devices
         w_ffn_gate_up.push_back(
             getFFNGateUp(meta, weights, layer, idev, ndev));
+            
+        // Extract FFN down projection [di/ndev, d] 
+        // Partitioned by input dimension across devices
         w_ffn_down.push_back(
             getFFNDown(meta, weights, layer, idev, ndev));
     }
 
+    // Create memory pool for efficient buffer allocation (128MB)
+    // This pool manages temporary tensors during inference to avoid frequent malloc/free
     auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
 
+    // Populate device resource structure with all initialized components
+    // This structure contains everything needed for inference on this device
     *rsrc = DeviceResource{
-        device,
-        dev_id,
-        handle,
-        getInEmbd(meta, weights),
-        getOutNorm(meta, weights),
-        getOutEmbd(meta, weights),
-        getSinTable(meta),
-        getCosTable(meta),
-        w_attn_norm,
-        w_attn_qkv,
-        b_attn_qkv,
-        w_attn_out,
-        w_ffn_norm,
-        w_ffn_gate_up,
-        w_ffn_down,
-        stream,
-        comm,
-        memory_pool,
+        device,                    // InfiniCore device type (GPU/CPU)
+        dev_id,                   // Physical device ID
+        handle,                   // InfiniCore operation handle
+        getInEmbd(meta, weights), // Input embedding table [dvoc, d]
+        getOutNorm(meta, weights),// Output normalization weights [d] 
+        getOutEmbd(meta, weights),// Output embedding/LM head [d, dvoc]
+        getSinTable(meta),        // RoPE sine table [dctx, dh/2]
+        getCosTable(meta),        // RoPE cosine table [dctx, dh/2]
+        w_attn_norm,             // Attention norm weights per layer
+        w_attn_qkv,              // QKV projection weights per layer  
+        b_attn_qkv,              // QKV bias weights per layer (optional)
+        w_attn_out,              // Attention output weights per layer
+        w_ffn_norm,              // FFN norm weights per layer
+        w_ffn_gate_up,           // FFN gate & up weights per layer
+        w_ffn_down,              // FFN down weights per layer
+        stream,                  // Execution stream for async ops
+        comm,                    // Inter-device communication context
+        memory_pool,             // Memory pool for temporary buffers
     };
+    
+    // Synchronize device to ensure all initialization is complete
     RUN_INFINI(infinirtDeviceSynchronize());
 }
 
+/*
+ * Device Resource Cleanup and Memory Deallocation
+ * 
+ * Properly releases all device resources in reverse order of allocation:
+ * 1. Synchronize device to complete all pending operations
+ * 2. Release tensor memory (shared_ptr automatically handles reference counting)
+ * 3. Destroy InfiniCore handles and streams
+ * 4. Clean up communication contexts
+ * 
+ * This prevents memory leaks and ensures proper cleanup of GPU resources
+ */
 void releaseDeviceResource(DeviceResource &res) {
+    // Wait for all pending operations to complete before cleanup
     infinirtDeviceSynchronize();
-    // Release individual Tensors
-    res.w_in_embd.reset();
-    res.w_out_norm.reset();
-    res.w_out_embd.reset();
-    res.sin_table.reset();
-    res.cos_table.reset();
+    
+    // Release tensor memory by resetting shared_ptr references
+    // The underlying memory will be freed when reference count reaches zero
+    // Release global model tensors (input/output embeddings, normalization, RoPE tables)
+    res.w_in_embd.reset();     // Input embedding table [dvoc, d]
+    res.w_out_norm.reset();    // Final layer norm [d]
+    res.w_out_embd.reset();    // Output projection/LM head [d, dvoc] 
+    res.sin_table.reset();     // RoPE sine lookup table [dctx, dh/2]
+    res.cos_table.reset();     // RoPE cosine lookup table [dctx, dh/2]
+    
+    // Release per-layer attention weights and clear vectors
     for (auto &t : res.w_attn_norm) {
-        t.reset();
+        t.reset();             // Attention layer norm weights [d]
     }
     res.w_attn_norm.clear();
+    
     for (auto &t : res.w_attn_qkv) {
-        t.reset();
+        t.reset();             // QKV projection weights [d, (nh+2*nkvh)/ndev * dh]
     }
     res.w_attn_qkv.clear();
+    
     for (auto &t : res.b_attn_qkv) {
-        t.reset();
+        t.reset();             // QKV bias weights [(nh+2*nkvh)/ndev * dh]
     }
     res.b_attn_qkv.clear();
+    
     for (auto &t : res.w_attn_out) {
-        t.reset();
+        t.reset();             // Attention output weights [nh/ndev * dh, d]
     }
     res.w_attn_out.clear();
+    
+    // Release per-layer FFN weights and clear vectors
     for (auto &t : res.w_ffn_norm) {
-        t.reset();
+        t.reset();             // FFN layer norm weights [d]
     }
     res.w_ffn_norm.clear();
+    
     for (auto &t : res.w_ffn_gate_up) {
-        t.reset();
+        t.reset();             // FFN gate & up weights [d, 2*di/ndev]
     }
     res.w_ffn_gate_up.clear();
+    
     for (auto &t : res.w_ffn_down) {
-        t.reset();
+        t.reset();             // FFN down weights [di/ndev, d]
     }
     res.w_ffn_down.clear();
-    infiniopDestroyHandle(res.handle);
+    
+    // Destroy InfiniCore handles and contexts
+    infiniopDestroyHandle(res.handle);    // Release operation handle
     res.handle = nullptr;
-    infinirtStreamDestroy(res.stream);
+    
+    infinirtStreamDestroy(res.stream);    // Release execution stream  
     res.stream = nullptr;
-    infinicclCommDestroy(res.comm);
+    
+    infinicclCommDestroy(res.comm);       // Release communication context
     res.comm = nullptr;
 }
 
+/*
+ * Device-Level Batch Inference Function
+ * 
+ * Performs transformer inference for a batch of sequences on a single device.
+ * Implements the complete forward pass including:
+ * 1. Input embedding lookup and RoPE position encoding
+ * 2. Multi-layer transformer blocks (attention + FFN)
+ * 3. Output normalization and probability distribution
+ * 4. Token sampling with temperature/top-k/top-p
+ * 
+ * This function handles distributed inference via tensor parallelism where
+ * each device processes a slice of the model parameters.
+ * 
+ * Input Parameters:
+ * - meta: Model architecture metadata (dimensions, layer count, etc.)
+ * - rsrc: Device resources (weights, handles, memory pools)
+ * - idev/ndev: Device index and total device count for distributed inference
+ * - tokens: Input token IDs to process [ntok]
+ * - ntok: Total number of tokens across all requests in batch
+ * - req_lens: Length of each request [nreq] 
+ * - nreq: Number of requests in the batch
+ * - req_pos: Starting position for each request in KV cache [nreq]
+ * - kv_caches: KV cache storage for each request [nreq][ndev][nlayer]
+ * - temperature/topk/topp: Sampling parameters [nreq]
+ * - output: Generated token IDs [nreq]
+ * 
+ * Tensor Dimension Notation:
+ * - ntok: Total tokens in batch
+ * - nreq: Number of requests  
+ * - d: Model hidden dimension
+ * - nh: Total attention heads
+ * - nkvh: Total key-value heads  
+ * - dh: Head dimension (d/nh)
+ * - di: FFN intermediate dimension
+ * - dvoc: Vocabulary size
+ * - dctx: Maximum context length
+ */
 void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       uint32_t idev, uint32_t ndev,
                       const uint32_t *tokens, uint32_t ntok,
@@ -117,19 +259,46 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output) {
-    auto nlayer = meta.nlayer;
-    auto nkvh = meta.nkvh / ndev;
-    auto nh = meta.nh / ndev;
-    auto ngroup = nh / nkvh;
-    // auto dctx = meta.dctx;
-    auto dh = meta.dh;
-    auto d = meta.d;
-    auto dt_logits = meta.dt_logits;
-    auto di = meta.di / ndev;
-    auto dvoc = meta.dvoc;
-    auto stream = rsrc.stream;
-    bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;
+    /*
+     * Extract Model Dimensions and Configure for Distributed Inference
+     * 
+     * Key dimension calculations for tensor parallelism:
+     * - nkvh: Key-value heads per device = total_kv_heads / ndev
+     * - nh: Query heads per device = total_heads / ndev  
+     * - ngroup: Grouped query attention ratio = nh / nkvh
+     * - di: FFN intermediate dim per device = total_intermediate / ndev
+     * 
+     * This ensures each device handles a slice of the attention heads
+     * and FFN dimensions while maintaining the same sequence processing.
+     */
+    auto nlayer = meta.nlayer;          // Number of transformer layers
+    auto nkvh = meta.nkvh / ndev;       // KV heads per device (distributed)
+    auto nh = meta.nh / ndev;           // Query heads per device (distributed) 
+    auto ngroup = nh / nkvh;            // Grouped-query attention factor
+    // auto dctx = meta.dctx;           // Maximum context length (unused)
+    auto dh = meta.dh;                  // Head dimension
+    auto d = meta.d;                    // Model hidden dimension  
+    auto dt_logits = meta.dt_logits;    // Data type for logits (FP16/BF16/FP32)
+    auto di = meta.di / ndev;           // FFN intermediate dim per device
+    auto dvoc = meta.dvoc;              // Vocabulary size
+    auto stream = rsrc.stream;          // Execution stream for async operations
+    bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;  // Whether QKV has bias terms
 
+    /*
+     * Memory Buffer Allocation for Inference Pipeline
+     * 
+     * Allocate temporary buffers for intermediate computations.
+     * All buffers use the device memory pool for efficient allocation/deallocation.
+     * 
+     * Buffer Tensor Shapes:
+     * - logits_in/out: [ntok, d] - hidden states flowing through layers
+     * - qkv_buf: [ntok, (nh + nkvh*2) * dh] - Q, K, V projections concatenated
+     * - gate_up_buf: [ntok, 2*di] - FFN gate and up projections concatenated  
+     * - o_buf: [ntok, nh*dh] - attention output before output projection
+     * - prob_buf: [nreq, dvoc] - output probability distributions
+     * - result_buf: [nreq] - sampled token IDs (device memory)
+     * - result_cpu: [nreq] - sampled token IDs (host memory for output)
+     */
     // Allocate buffers
     auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
     auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
@@ -140,9 +309,25 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto result_buf = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
     auto result_cpu = std::vector<int64_t>(nreq);
 
+    /*
+     * Input Preparation and Token Embedding Lookup
+     * 
+     * 1. Create position IDs for each token based on request positions
+     * 2. Copy position IDs to device memory if needed
+     * 3. Look up input embeddings for each token ID
+     * 
+     * Position ID Calculation:
+     * For each request, position IDs are: [req_pos[i], req_pos[i]+1, ..., req_pos[i]+req_lens[i]-1]
+     * This allows proper attention masking and RoPE position encoding.
+     * 
+     * Embedding Lookup: logits_in[i] = w_in_embd[tokens[i]] for i in [0, ntok)
+     * Shape: [ntok, d] where each row is the embedding vector for token tokens[i]
+     */
     // Prepare inputs
     auto batch_pos_ids = std::vector<uint32_t>(ntok);
     size_t req_start = 0;
+    
+    // Build position ID array: concatenate position sequences for each request
     for (uint32_t req = 0; req < nreq; req++) {
         for (uint32_t i = 0; i < req_lens[req]; i++) {
             batch_pos_ids[req_start + i] = req_pos[req] + i;
@@ -150,17 +335,23 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         req_start += req_lens[req];
     }
 
+    // Copy position IDs to device memory (CPU device can use host pointer directly)
     std::shared_ptr<Tensor> pos_ids_buf;
     if (rsrc.device == INFINI_DEVICE_CPU) {
         pos_ids_buf = Tensor::weight(batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
     } else {
         pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
+        // Asynchronous host-to-device copy of position IDs [ntok]
         RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
                                        INFINIRT_MEMCPY_H2D, stream));
     }
+    
+    // Look up input embeddings: logits_in[i] = w_in_embd[tokens[i]]
+    // This performs embedding table lookup for each input token
+    // Shape transformation: [ntok] token IDs -> [ntok, d] embedding vectors
     for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                       rsrc.w_in_embd->data(tokens[i] * d),
+        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),                // Destination: row i of logits_in
+                                       rsrc.w_in_embd->data(tokens[i] * d),   // Source: embedding for tokens[i]
                                        dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
     }
 
