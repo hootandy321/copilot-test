@@ -19,6 +19,7 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <cassert>
 
 /*
  * 设备资源创建和初始化
@@ -80,13 +81,17 @@ void createQwen3DeviceResource(DeviceQwen3Resource *rsrc, const Qwen3Meta *meta,
         w_mlp_norm, w_mlp_gate_proj, w_mlp_up_proj, w_mlp_down_proj;
 
 
-        // 新的分离权重提取方式
+    // 新的分离权重提取方式
     for (size_t layer = 0; layer < meta->nlayer; layer++) {
 
+        // 添加注意力层归一化权重提取（这个被遗漏了！）
+        w_attn_norm.push_back(
+            getQwen3AttnNorm(meta, weights, layer));    // [d] - 注意力层归一化权重
+
         // Qwen3 特有：Q/K 归一化权重（每层每头维度）
+
         w_attn_q_norm.push_back(
             getQwen3QNorm(meta, weights, layer));     // [dh] - Q 归一化权重
-        
         w_attn_k_norm.push_back(
             getQwen3KNorm(meta, weights, layer));     // [dh] - K 归一化权重
         
@@ -94,20 +99,21 @@ void createQwen3DeviceResource(DeviceQwen3Resource *rsrc, const Qwen3Meta *meta,
         // Q 投影权重：[d, nh/ndev * dh] - 按查询头分区
         w_attn_q_proj.push_back(
             getQwen3AttnQ(meta, weights, layer, idev, ndev));
-        
+
         // K 投影权重：[d, nkvh/ndev * dh] - 按键值头分区  
         w_attn_k_proj.push_back(
             getQwen3AttnK(meta, weights, layer, idev, ndev));
-        
+
         // V 投影权重：[d, nkvh/ndev * dh] - 按键值头分区
         w_attn_v_proj.push_back(
             getQwen3AttnV(meta, weights, layer, idev, ndev));
-        
+
         // 注意力输出投影：[nh/ndev * dh, d] - 按输入维度分区
         w_attn_o_proj.push_back(
             getQwen3AttnO(meta, weights, layer, idev, ndev));
 
         // MLP 层权重
+
         // MLP 前归一化：[d] - 在所有设备上复制
         w_mlp_norm.push_back(
             getQwen3MLPNorm(meta, weights, layer));
@@ -119,16 +125,17 @@ void createQwen3DeviceResource(DeviceQwen3Resource *rsrc, const Qwen3Meta *meta,
         // MLP Up 投影：[d, di/ndev] - 按中间维度分区  
         w_mlp_up_proj.push_back(
             getQwen3MLPUp(meta, weights, layer, idev, ndev));
-        
+
         // MLP Down 投影：[di/ndev, d] - 按输入维度分区
         w_mlp_down_proj.push_back(
             getQwen3MLPDown(meta, weights, layer, idev, ndev));
+
     }
 
     // 创建用于高效缓冲区分配的内存池（128MB）
     // 此池在推理期间管理临时张量以避免频繁的 malloc/free
-    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
-
+        // 增加内存池大小
+    auto memory_pool = std::make_shared<MemoryPool>(512 * 1024 * 1024); // 从128MB增加到512MB
     // 使用所有初始化的组件填充设备资源结构
     // 此结构包含在此设备上推理所需的一切
     *rsrc = DeviceQwen3Resource{
@@ -280,6 +287,13 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
                       struct Qwen3KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output) {
+
+    if (meta.nh < ndev || meta.nkvh < ndev) {
+        throw std::runtime_error(
+            "Invalid distributed setup: heads (" + std::to_string(meta.nh) + 
+            ", " + std::to_string(meta.nkvh) + 
+            ") must be >= devices (" + std::to_string(ndev) + ")");
+    }
     /*
      * 提取模型维度并配置分布式推理
      * 
@@ -304,6 +318,28 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     auto dvoc = meta.dvoc;              // 词汇表大小
     auto stream = rsrc.stream;          // 用于异步操作的执行流
 
+    if (nh == 0 || nkvh == 0) {
+        throw std::runtime_error("Zero heads after distribution - check model/device configuration");
+    }
+    
+    if (ntok == 0 || nreq == 0) {
+        throw std::runtime_error("Invalid batch size: ntok=" + std::to_string(ntok) + 
+                                ", nreq=" + std::to_string(nreq));
+    }
+    
+    // 计算预期内存使用量
+    size_t total_memory_needed = 0;
+    total_memory_needed += ntok * d * dsize(dt_logits) * 2; // logits_in + logits_out
+    total_memory_needed += ntok * nh * dh * dsize(dt_logits) * 3; // q_buf + q_norm_buf + o_buf  
+    total_memory_needed += ntok * nkvh * dh * dsize(dt_logits) * 3; // k_buf + k_norm_buf + v_buf
+    total_memory_needed += ntok * di * dsize(dt_logits) * 2; // gate_buf + up_buf
+    total_memory_needed += nreq * dvoc * dsize(dt_logits); // prob_buf
+    total_memory_needed += nreq * sizeof(int64_t); // result_buf
+
+
+    if (!rsrc.memory_pool) {
+        throw std::runtime_error("Memory pool is null");
+    }
 
     /*
      * 推理流水线的内存缓冲区分配
@@ -322,10 +358,20 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
      */
 
     auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+    assert(logits_in != nullptr && "logits_in allocation failed");
+
+    if (!logits_in) {
+        throw std::runtime_error("Failed to allocate logits_in buffer");
+    }
+    
     auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+    assert(logits_out != nullptr && "logits_out allocation failed");
+    if (!logits_out) {
+        throw std::runtime_error("Failed to allocate logits_out buffer");
+    }
     
     auto q_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);      // Q 投影输出
-    auto k_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);    // K 投影输出  
+    auto k_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);    // K 投影输出  、
     auto v_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);    // V 投影输出
 
     auto q_norm_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool); // Q 归一化后
@@ -337,75 +383,65 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     auto result_buf = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
     auto result_cpu = std::vector<int64_t>(nreq);
 
-    /*
-     * 输入准备和 Token 嵌入查找
-     * 
-     * 1. 根据请求位置为每个 token 创建位置 ID
-     * 2. 如果需要，将位置 ID 复制到设备内存
-     * 3. 查找每个 token ID 的输入嵌入
-     * 
-     * 位置 ID 计算：
-     * 对于每个请求，位置 ID 是：[req_pos[i], req_pos[i]+1, ..., req_pos[i]+req_lens[i]-1]
-     * 这允许正确的注意力掩码和 RoPE 位置编码。
-     * 
-     * 嵌入查找：logits_in[i] = w_in_embd[tokens[i]] 对于 i 在 [0, ntok) 范围内
-     * 形状：[ntok, d] 其中每行是 token tokens[i] 的嵌入向量
-     */
-    // 准备输入
-    auto batch_pos_ids = std::vector<uint32_t>(ntok);
-    size_t req_start = 0;
+
+        /*
+         * 输入准备和 Token 嵌入查找
+         */
+        
+        // 准备输入
+        auto batch_pos_ids = std::vector<uint32_t>(ntok);
+        size_t req_start = 0;
     
-    // 构建位置 ID 数组：连接每个请求的位置序列
-    for (uint32_t req = 0; req < nreq; req++) {
-        for (uint32_t i = 0; i < req_lens[req]; i++) {
-            batch_pos_ids[req_start + i] = req_pos[req] + i;
+        // 构建位置 ID 数组：连接每个请求的位置序列
+        for (uint32_t req = 0; req < nreq; req++) {
+            for (uint32_t i = 0; i < req_lens[req]; i++) {
+                batch_pos_ids[req_start + i] = req_pos[req] + i;
+            }
+            req_start += req_lens[req];
         }
-        req_start += req_lens[req];
-    }
-
-    // 将位置 ID 复制到设备内存（CPU 设备可以直接使用主机指针）
-    std::shared_ptr<Tensor> pos_ids_buf;
-    if (rsrc.device == INFINI_DEVICE_CPU) {
-        pos_ids_buf = Tensor::weight(batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
-    } else {
-        pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
-        // 位置 ID 的异步主机到设备复制 [ntok]
-        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
-                                       INFINIRT_MEMCPY_H2D, stream));
-    }
+        // 将位置 ID 复制到设备内存（CPU 设备可以直接使用主机指针）
+        std::shared_ptr<Tensor> pos_ids_buf;
+        if (rsrc.device == INFINI_DEVICE_CPU) {
+            pos_ids_buf = Tensor::weight(batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
+        } else {
+            pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
+            // 位置 ID 的异步主机到设备复制 [ntok]
+            RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
+                                           INFINIRT_MEMCPY_H2D, stream));
+        }
+        
+        // 查找输入嵌入：logits_in[i] = w_in_embd[tokens[i]]
+        for (uint32_t i = 0; i < ntok; i++) {
+            if (tokens[i] >= meta.dvoc) {
+                printf("Error: Invalid token ID %u >= vocab_size %zu\n", tokens[i], meta.dvoc);
+                throw std::runtime_error("Invalid token ID");
+            }
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),                // 目标：logits_in 的第 i 行
+                                           rsrc.w_in_embd->data(tokens[i] * d),   // 源：tokens[i] 的嵌入
+                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+        }
+        
     
-    // 查找输入嵌入：logits_in[i] = w_in_embd[tokens[i]]
-    // 这为每个输入 token 执行嵌入表查找
-    // 形状变换：[ntok] token ID -> [ntok, d] 嵌入向量
-    for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),                // 目标：logits_in 的第 i 行
-                                       rsrc.w_in_embd->data(tokens[i] * d),   // 源：tokens[i] 的嵌入
-                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
-    }
+        /*
+         * InfiniCore 操作符描述符创建和工作区大小计算
+         */
+        
+        // 准备操作符和工作区
+        size_t workspace_size = 0, temp_size = 0;
+        infiniopRMSNormDescriptor_t desc_norm;
+        
 
-    /*
-     * InfiniCore 操作符描述符创建和工作区大小计算
-     * 
-     * 此部分为推理流水线中所需的所有计算操作创建描述符。
-     * 描述符定义操作参数、张量形状和要使用的算法。
-     * InfiniCore 将使用这些描述符来：
-     * 1. 基于硬件能力优化内核选择
-     * 2. 计算临时计算所需的工作区内存
-     * 3. 实现跨多次调用的高效操作符重用
-     * 
-     * 工作区大小计算为所有操作的最大值以确保
-     * 单个分配可以处理任何中间计算。
-     */
-    // 准备操作符和工作区
-    size_t workspace_size = 0, temp_size = 0;
-    infiniopRMSNormDescriptor_t desc_norm;
-    RUN_INFINI(infiniopCreateRMSNormDescriptor(
-        rsrc.handle, &desc_norm, logits_in->desc(),     // 输入：[ntok, d]
-        logits_out->desc(), rsrc.w_attn_norm[0]->desc(), // 输出：[ntok, d]，权重：[d]
-        meta.epsilon));                                   // 归一化 epsilon
-    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm, &workspace_size));
-    workspace_size = std::max(workspace_size, temp_size);
-    
+RUN_INFINI(infiniopCreateRMSNormDescriptor(
+    rsrc.handle, &desc_norm, logits_in->desc(),     // 输入：[ntok, d]
+    logits_out->desc(), rsrc.w_attn_norm[0]->desc(), // 输出：[ntok, d]，权重：[d]
+    meta.epsilon));                                   // 归一化 epsilon
+
+RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_norm, &workspace_size));
+
+workspace_size = std::max(workspace_size, temp_size);
+
+
+
     /*
      * 注意力机制描述符
      * 
@@ -418,10 +454,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     
     // QKV 投影和注意力输出的 GEMM 描述符
     infiniopGemmDescriptor_t desc_attn_q, desc_attn_k, desc_attn_v, desc_attn_o;
-    // Qwen3 特有：Q/K 归一化描述符
-    infiniopRMSNormDescriptor_t desc_q_norm, desc_k_norm;
-    // RoPE 描述符 (应用到归一化后的 Q/K)
-    infiniopRoPEDescriptor_t desc_rope_q, desc_rope_k;
     /*
      * QKV 投影 GEMM：logits_in * w_attn_qkv -> qkv_buf
      * 
@@ -454,42 +486,102 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_v, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
 
-    // 创建 Q/K 归一化描述符
-    // Q 归一化：q_buf -> q_norm_buf
-    RUN_INFINI(infiniopCreateRMSNormDescriptor(
-        rsrc.handle, &desc_q_norm,
-        q_norm_buf->desc(), q_buf->desc(),
-        rsrc.w_attn_q_norm[0]->desc(), meta.epsilon));
-    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_q_norm, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
 
-    // K 归一化：k_buf -> k_norm_buf  
-    RUN_INFINI(infiniopCreateRMSNormDescriptor(
-        rsrc.handle, &desc_k_norm,
-        k_norm_buf->desc(), k_buf->desc(),
-        rsrc.w_attn_k_norm[0]->desc(), meta.epsilon));
-    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_k_norm, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
+    // 重构多头 Q/K 归一化处理
 
     /*
-    * RoPE 描述符 (更新为使用归一化后的张量)
+        * 多头 Q/K 归一化描述符创建
+        * 
+        * Qwen3 的 Q/K 归一化是按头独立应用的：
+        * - 每个头有独立的归一化权重 [dh]
+        * - 需要为每个头创建单独的归一化描述符
+        * - 或者使用循环在推理时分别处理每个头
+        */
+
+    // 方案1：创建单个头的归一化描述符，在推理循环中重复使用
+    infiniopRMSNormDescriptor_t desc_q_norm_single, desc_k_norm_single;
+    
+    // 创建单个头的张量描述符 [ntok, dh]
+    auto q_single_head = TensorDesc::create(dt_logits, {ntok, dh});
+    auto q_norm_single_head = TensorDesc::create(dt_logits, {ntok, dh});
+    auto k_single_head = TensorDesc::create(dt_logits, {ntok, dh});
+    auto k_norm_single_head = TensorDesc::create(dt_logits, {ntok, dh});
+    
+    RUN_INFINI(infiniopCreateRMSNormDescriptor(
+        rsrc.handle, &desc_q_norm_single,
+        q_norm_single_head->desc(), q_single_head->desc(),
+        rsrc.w_attn_q_norm[0]->desc(), meta.epsilon));
+    RUN_INFINI(infiniopCreateRMSNormDescriptor(
+        rsrc.handle, &desc_k_norm_single,
+        k_norm_single_head->desc(), k_single_head->desc(),
+        rsrc.w_attn_k_norm[0]->desc(), meta.epsilon));
+    
+    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_q_norm_single, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    RUN_INFINI(infiniopGetRMSNormWorkspaceSize(desc_k_norm_single, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    
+
+    /*
+    * RoPE 描述符 - 仍然使用 3D 格式，但在推理时分头处理
     */
-    // Q RoPE：q_norm_buf -> q_norm_buf (就地操作)
+    infiniopRoPEDescriptor_t desc_rope_q_single, desc_rope_k_single;
+    
+    // 创建单个头的 3D RoPE 描述符 [ntok, 1, dh]
+    auto q_rope_single_head_3d = TensorDesc::create(dt_logits, {ntok, 1, dh});
+    auto k_rope_single_head_3d = TensorDesc::create(dt_logits, {ntok, 1, dh});
+
     RUN_INFINI(infiniopCreateRoPEDescriptor(
-        rsrc.handle, &desc_rope_q, q_norm_buf->desc(), q_norm_buf->desc(),
-        pos_ids_buf->desc(), rsrc.sin_table->desc(),
-        rsrc.cos_table->desc()));
-    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_q, &temp_size));
+        rsrc.handle, &desc_rope_q_single, 
+        q_rope_single_head_3d->desc(), q_rope_single_head_3d->desc(),
+        pos_ids_buf->desc(),                     
+        rsrc.sin_table->desc(),                  
+        rsrc.cos_table->desc()));               
+        
+    RUN_INFINI(infiniopCreateRoPEDescriptor(
+        rsrc.handle, &desc_rope_k_single, 
+        k_rope_single_head_3d->desc(), k_rope_single_head_3d->desc(),
+        pos_ids_buf->desc(),                     
+        rsrc.sin_table->desc(),                  
+        rsrc.cos_table->desc()));               
+        
+    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_q_single, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_k_single, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
 
-    // K RoPE：k_norm_buf -> k_norm_buf (就地操作)
-    RUN_INFINI(infiniopCreateRoPEDescriptor(
-        rsrc.handle, &desc_rope_k, k_norm_buf->desc(), k_norm_buf->desc(),
-        pos_ids_buf->desc(), rsrc.sin_table->desc(),
-        rsrc.cos_table->desc()));
-    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_k, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
+    // /*
+    // * RoPE 描述符 (更新为使用归一化后的张量)
+    // */
+    // // Q RoPE：q_norm_buf -> q_norm_buf (就地操作)
 
+    // auto q_norm_3d = q_norm_buf->dimSplit(1, {nh, dh});
+    // auto k_norm_3d = k_norm_buf->dimSplit(1, {nkvh, dh});
+
+    // printf("Debug: Creating Q RoPE descriptor\n");
+    // printf("Debug: Expected shapes - q_norm_3d: [%u, %zu, %zu]\n", ntok, nh, dh);
+    
+
+    // RUN_INFINI(infiniopCreateRoPEDescriptor(
+    //     rsrc.handle, &desc_rope_q, 
+    //     q_norm_3d->desc(), q_norm_3d->desc(),    // 输入/输出都是 3D
+    //     pos_ids_buf->desc(),                     // 位置 ID [ntok]
+    //     rsrc.sin_table->desc(),                  // 正弦表 [dctx, dh/2]
+    //     rsrc.cos_table->desc()));               // 余弦表 [dctx, dh/2]
+
+    // RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_q, &temp_size));
+    // workspace_size = std::max(workspace_size, temp_size);
+
+    // // K RoPE：k_norm_buf -> k_norm_buf (就地操作)
+    // RUN_INFINI(infiniopCreateRoPEDescriptor(
+    //     rsrc.handle, &desc_rope_k, 
+    //     k_norm_3d->desc(), k_norm_3d->desc(),    // 输入/输出都是 3D
+    //     pos_ids_buf->desc(),                     // 位置 ID [ntok]  
+    //     rsrc.sin_table->desc(),                  // 正弦表 [dctx, dh/2]
+    //     rsrc.cos_table->desc()));               // 余弦表 [dctx, dh/2]
+    // RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_k, &temp_size));
+    // workspace_size = std::max(workspace_size, temp_size);
+    // printf("Debug: RoPE descriptors created successfully\n");
 
 
     /*
@@ -508,48 +600,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_attn_o, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
 
-
-    /*
-     * RoPE（旋转位置嵌入）描述符
-     * 
-     * RoPE 将旋转变换应用于查询和键向量：
-     * 对于每个位置 pos 和维度对 (i, i+d/2)：
-     * q'[i] = q[i] * cos(pos/θ^(i/d)) - q[i+d/2] * sin(pos/θ^(i/d))
-     * q'[i+d/2] = q[i] * sin(pos/θ^(i/d)) + q[i+d/2] * cos(pos/θ^(i/d))
-     * 
-     * 此编码允许模型理解 token 之间的相对位置。
-     */
-    
-    infiniopRoPEDescriptor_t desc_rope_q, desc_rope_k;
-    
-    /*
-     * 查询向量的 RoPE 描述符
-     * 
-     * 基于位置 ID 和预计算的正弦/余弦表对查询应用位置编码
-     * 输入/输出：[ntok, nh, dh] -> [ntok, nh, dh]
-     * 位置 ID：[ntok] - 每个 token 在其序列中的位置
-     * 正弦/余弦表：[dctx, dh/2] - 预计算的三角值
-     */
-    RUN_INFINI(infiniopCreateRoPEDescriptor(
-        rsrc.handle, &desc_rope_q, q_buf->desc(), q_buf->desc(),
-        pos_ids_buf->desc(), rsrc.sin_table->desc(),
-        rsrc.cos_table->desc()));
-    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_q, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
-    
-
-    /*
-     * 键向量的 RoPE 描述符
-     * 
-     * 对键应用相同的位置编码
-     * 输入/输出：[ntok, nkvh, dh] -> [ntok, nkvh, dh]
-     */
-    RUN_INFINI(infiniopCreateRoPEDescriptor(
-        rsrc.handle, &desc_rope_k, k_buf->desc(), k_buf->desc(),
-        pos_ids_buf->desc(), rsrc.sin_table->desc(),
-        rsrc.cos_table->desc()));
-    RUN_INFINI(infiniopGetRoPEWorkspaceSize(desc_rope_k, &temp_size));
-    workspace_size = std::max(workspace_size, temp_size);
 
 
     /*
@@ -583,8 +633,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     size_t max_qk_size = 0;    // 用于缓冲区分配的最大 QK 矩阵大小
     size_t max_seq_len = 0;    // 用于缓冲区分配的最大序列长度
     
-    // 为注意力头准备输出缓冲区：[ntok, nh, dh]
-    o_buf->dimSplit(1, {nh, dh});
     /*
      * 为每个请求的注意力计算创建描述符
      * 每个请求可能有不同的序列长度和过去的 KV 缓存长度，
@@ -604,11 +652,20 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
          * - k：[seq_len, nkvh, dh] - 此请求的键向量
          * - v：[seq_len, nkvh, dh] - 此请求的值向量（稍后使用）
          */
-        auto o = o_buf->slice({{0, token_offset, seq_len}});
-        auto q = q_buf->slice({{0, token_offset, seq_len}});     // Qwen3使用独立的q_buf
-        auto k = k_buf->slice({{0, token_offset, seq_len}});     // Qwen3使用独立的k_buf
-        auto v = v_buf->slice({{0, token_offset, seq_len}});     // Qwen3使用独立的v_buf
-
+         
+        // 步骤1：从2D缓冲区切片出当前请求的部分
+        // 步骤1：从2D缓冲区切片出当前请求的部分
+        auto o_2d = o_buf->slice({{0, token_offset, seq_len}});          // [seq_len, nh*dh]
+        auto q_2d = q_norm_buf->slice({{0, token_offset, seq_len}});     // [seq_len, nh*dh] - 使用归一化后的Q
+        auto k_2d = k_norm_buf->slice({{0, token_offset, seq_len}});     // [seq_len, nkvh*dh] - 使用归一化后的K
+        
+        
+        // 步骤2：将2D切片分割成3D多头格式
+        auto o = o_2d->dimSplit(1, {nh, dh});       // [seq_len, nh*dh] -> [seq_len, nh, dh]
+        auto q = q_2d->dimSplit(1, {nh, dh});       // [seq_len, nh*dh] -> [seq_len, nh, dh] - 从归一化后的Q切片
+        auto k = k_2d->dimSplit(1, {nkvh, dh});
+        auto v = v_buf->slice({{0, token_offset, seq_len}}); // [seq_len, nkvh, dh]
+        
         // auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
         
         /*
@@ -622,7 +679,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
         // [nkvh, dh, total_len]
         auto full_kv = kv_caches[req]->k[idev][0]->slice(0, 0, total_len)->permute({1, 2, 0});
         auto cache_kv = kv_caches[req]->k[idev][0]->slice(0, past_len, seq_len);
-
         /*
          * KV 重新排列描述符：将当前 K/V 存储在缓存中
          * 将当前键/值转换为缓存存储格式：
@@ -630,7 +686,6 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
          */
         RUN_INFINI(infiniopCreateRearrangeDescriptor(rsrc.handle, &desc_kv_rearranges[req],
                                                      cache_kv->desc(), k->desc()));
-
 
         /*
          * 分组查询注意力（GQA）的查询重新排列
@@ -780,6 +835,15 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
         rsrc.handle, &desc_mlp_down, logits_in->desc(),
         gate_buf->desc(), rsrc.w_mlp_down_proj[0]->desc()));
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_mlp_down, &temp_size));
+    workspace_size = std::max(workspace_size, temp_size);
+
+
+    RUN_INFINI(infiniopCreateSwiGLUDescriptor(
+    rsrc.handle, &desc_swiglu,
+    gate_buf->desc(),           // 输出缓冲区
+    gate_buf->desc(),           // gate 输入（复用缓冲区）
+    up_buf->desc()));           // up 输入
+    RUN_INFINI(infiniopGetSwiGLUWorkspaceSize(desc_swiglu, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
 
     /*
@@ -954,37 +1018,84 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
          * Q 归一化：q_buf -> q_norm_buf
          * 这是 Qwen3 特有的步骤，在 RoPE 之前对 Q 进行归一化
          */
-        RUN_INFINI(infiniopRMSNorm(
-            desc_q_norm, workspace, workspace_size,
-            q_norm_buf->data(), q_buf->data(),
-            rsrc.w_attn_q_norm[layer]->data(), stream));
+        for (size_t head = 0; head < nh; head++) {
+            // 计算当前头在缓冲区中的偏移（以 dh 为单位）
+            size_t head_offset = head * dh;
+            
+            // 获取当前头的数据指针
+            void* q_head_input = (char*)q_buf->data() + head_offset * dsize(dt_logits);
+            void* q_head_output = (char*)q_norm_buf->data() + head_offset * dsize(dt_logits);
+            
+            // 对当前头应用归一化
+            RUN_INFINI(infiniopRMSNorm(
+                desc_q_norm_single, workspace, workspace_size,
+                q_head_output,                          // 输出：当前头的归一化结果
+                q_head_input,                           // 输入：当前头的原始数据
+                rsrc.w_attn_q_norm[layer]->data(),      // 权重：[dh]
+                stream));
+        }
         
         /*
          * K 归一化：k_buf -> k_norm_buf
          * 同样对 K 进行归一化
          */
-        RUN_INFINI(infiniopRMSNorm(
-            desc_k_norm, workspace, workspace_size,
-            k_norm_buf->data(), k_buf->data(),
-            rsrc.w_attn_k_norm[layer]->data(), stream));
-        
+        for (size_t head = 0; head < nkvh; head++) {
+
+            // 计算当前头在缓冲区中的偏移
+            size_t head_offset = head * dh;
+            
+            // 获取当前头的数据指针
+            void* k_head_input = (char*)k_buf->data() + head_offset * dsize(dt_logits);
+            void* k_head_output = (char*)k_norm_buf->data() + head_offset * dsize(dt_logits);
+            
+            // 对当前头应用归一化
+            RUN_INFINI(infiniopRMSNorm(
+                desc_k_norm_single, workspace, workspace_size,
+                k_head_output,                          // 输出：当前头的归一化结果
+                k_head_input,                           // 输入：当前头的原始数据
+                rsrc.w_attn_k_norm[layer]->data(),      // 权重：[dh]
+                stream));
+        }
         // ============================================================================
-        // 第三步：RoPE 应用到归一化后的 Q/K（修改输入源）
+        // 第三步：按头应用 RoPE
         // ============================================================================
+
+        for (size_t head = 0; head < nh; head++) {
+            
+            // 计算当前头在缓冲区中的偏移
+            size_t head_offset = head * dh;
+            
+            // 获取当前头的数据指针（归一化后的）
+            void* q_head_data = (char*)q_norm_buf->data() + head_offset * dsize(dt_logits);
+            
+            // 对当前头应用 RoPE（就地操作）
+            RUN_INFINI(infiniopRoPE(
+                desc_rope_q_single, workspace, workspace_size,
+                q_head_data, q_head_data,               // 就地操作
+                pos_ids_buf->data(),
+                rsrc.sin_table->data(),
+                rsrc.cos_table->data(), stream));
+        }
         
-        RUN_INFINI(infiniopRoPE(
-            desc_rope_q, workspace, workspace_size,
-            q_norm_buf->data(), q_norm_buf->data(),  // 使用归一化后的 Q
-            pos_ids_buf->data(),
-            rsrc.sin_table->data(),
-            rsrc.cos_table->data(), stream));
-        RUN_INFINI(infiniopRoPE(
-            desc_rope_k, workspace, workspace_size,
-            k_norm_buf->data(), k_norm_buf->data(),  // 使用归一化后的 K
-            pos_ids_buf->data(),
-            rsrc.sin_table->data(),
-            rsrc.cos_table->data(), stream));
-        
+        /*
+         * 按头处理 K RoPE
+         */
+        for (size_t head = 0; head < nkvh; head++) {
+            
+            // 计算当前头在缓冲区中的偏移
+            size_t head_offset = head * dh;
+            
+            // 获取当前头的数据指针（归一化后的）
+            void* k_head_data = (char*)k_norm_buf->data() + head_offset * dsize(dt_logits);
+            
+            // 对当前头应用 RoPE（就地操作）
+            RUN_INFINI(infiniopRoPE(
+                desc_rope_k_single, workspace, workspace_size,
+                k_head_data, k_head_data,               // 就地操作
+                pos_ids_buf->data(),
+                rsrc.sin_table->data(),
+                rsrc.cos_table->data(), stream));
+        }
         // ============================================================================
         // 第四步：每请求注意力计算（更新张量切片源）
         // ============================================================================
@@ -1325,11 +1436,12 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     infiniopDestroyGemmDescriptor(desc_attn_q);               // 查询投影
     infiniopDestroyGemmDescriptor(desc_attn_k);               // 键投影
     infiniopDestroyGemmDescriptor(desc_attn_v);               // 值投影
-    infiniopDestroyRMSNormDescriptor(desc_q_norm);            // 查询归一化
-    infiniopDestroyRMSNormDescriptor(desc_k_norm);            // 键归一化
     infiniopDestroyGemmDescriptor(desc_attn_o);               // 注意力输出投影
-    infiniopDestroyRoPEDescriptor(desc_rope_q);               // 查询的 RoPE
-    infiniopDestroyRoPEDescriptor(desc_rope_k);               // 键的 RoPE
+    infiniopDestroyRoPEDescriptor(desc_rope_q_single);               // 查询的 RoPE
+    infiniopDestroyRoPEDescriptor(desc_rope_k_single);               // 键的 RoPE
+    infiniopDestroyRMSNormDescriptor(desc_q_norm_single);     // 单头查询归一化 ✅ 添加这行
+    infiniopDestroyRMSNormDescriptor(desc_k_norm_single);     // 单头键归一化 ✅ 添加这行
+    
     
     // 清理每请求注意力描述符
     for (uint32_t req = 0; req < nreq; req++) {
@@ -1593,9 +1705,9 @@ Qwen3Model::Qwen3Model(const Qwen3Meta *_meta, const Qwen3Weights *weights, infi
 }
 
 /*
- * JiugeModel 创建函数（C 接口）
  * 
- * 创建用于分布式推理的新 JiugeModel 实例。
+ * 
+ * 创建用于分布式推理的新实例。
  * 这是从 C/Python 代码创建模型的主要入口点。
  * 
  * 参数：
@@ -1605,7 +1717,7 @@ Qwen3Model::Qwen3Model(const Qwen3Meta *_meta, const Qwen3Weights *weights, infi
  * - ndev：用于分布式推理的设备数
  * - dev_ids：物理设备 ID 数组 [ndev]
  * 
- * 返回：指向新创建的 JiugeModel 实例的指针
+ * 返回：指向新创建的实例的指针
  */
 __C struct Qwen3Model *
 createQwen3Model(const Qwen3Meta *meta,
@@ -1622,20 +1734,6 @@ createQwen3Model(const Qwen3Meta *meta,
     return model;
 }
 
-/*
- * Qwen3Model 销毁函数（C 接口）
- * 
- * 安全地销毁 JiugeModel 实例并清理所有资源。
- * 确保在释放前正确终止所有工作线程。
- * 
- * 关闭过程：
- * 1. 通过 exit_flag 向所有工作线程发出退出信号
- * 2. 通知在条件变量上等待的所有线程
- * 3. 连接所有线程以确保干净终止
- * 4. 释放模型实例
- * 
- * 这可以防止资源泄漏并确保优雅关闭。
- */
 __C void destroyQwen3Model(struct Qwen3Model *model) {
     auto ndev = model->dev_resources.size();
 

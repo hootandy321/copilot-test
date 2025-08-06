@@ -1,5 +1,5 @@
 import ctypes
-from ctypes import c_size_t, c_uint, c_int, c_float, c_void_p, POINTER
+from ctypes import c_size_t, c_uint, c_int, c_float, c_void_p, c_bool, POINTER
 import os
 
 
@@ -36,85 +36,63 @@ class DeviceType(ctypes.c_int):
     DEVICE_TYPE_ILUVATAR = 6
 
 
-class JiugeMetaCStruct(ctypes.Structure):
-    _fields_ = [
-        ("dt_logits", DataType),
-        ("nlayer", c_size_t),
-        ("d", c_size_t),
-        ("nh", c_size_t),
-        ("nkvh", c_size_t),
-        ("dh", c_size_t),
-        ("di", c_size_t),
-        ("dctx", c_size_t),
-        ("dvoc", c_size_t),
-        ("epsilon", c_float),
-        ("theta", c_float),
-        ("end_token", c_uint),
-    ]
-
-
-# Define the JiugeWeights struct
-class JiugeWeightsCStruct(ctypes.Structure):
-    _fields_ = [
-        ("nlayer", c_size_t),
-        ("dt_norm", DataType),
-        ("dt_mat", DataType),
-        ("transpose_linear_weights", c_int),
-        ("input_embd", c_void_p),
-        ("output_norm", c_void_p),
-        ("output_embd", c_void_p),
-        ("attn_norm", POINTER(c_void_p)),
-        ("attn_qkv", POINTER(c_void_p)),
-        ("attn_qkv_b", POINTER(c_void_p)),
-        ("attn_o", POINTER(c_void_p)),
-        ("ffn_norm", POINTER(c_void_p)),
-        ("ffn_gate_up", POINTER(c_void_p)),
-        ("ffn_down", POINTER(c_void_p)),
-    ]
-
-
 class Qwen3MetaCStruct(ctypes.Structure):
     _fields_ = [
-        ("dt_logits", DataType),
-        ("nlayer", c_size_t),
-        ("d", c_size_t),
-        ("nh", c_size_t),
-        ("nkvh", c_size_t),
-        ("dh", c_size_t),
-        ("di", c_size_t),
-        ("dctx", c_size_t),
-        ("dvoc", c_size_t),
-        ("epsilon", c_float),
-        ("theta", c_float),
-        ("end_token", c_uint),
-        ("sliding_windows", POINTER(c_uint)),
-        ("layer_types", POINTER(c_uint)),
+        # 数据类型
+        ("dt_logits", DataType),        # infiniDtype_t dt_logits
+        
+        # 网络规模
+        ("nlayer", c_size_t),          # size_t nlayer
+        ("d", c_size_t),               # size_t d
+        ("nh", c_size_t),              # size_t nh
+        ("nkvh", c_size_t),            # size_t nkvh
+        ("dh", c_size_t),              # size_t dh
+        ("di", c_size_t),              # size_t di
+        ("dctx", c_size_t),            # size_t dctx
+        ("dvoc", c_size_t),            # size_t dvoc
+        
+        # 归一化与RoPE
+        ("epsilon", c_float),          # float epsilon
+        ("theta", c_float),            # float theta
+        
+        # 额外字段
+        ("bos_token", c_uint),         # uint32_t bos_token
+        ("end_token", c_uint),         # uint32_t end_token
+        ("attn_dropout", c_float),     # float attn_dropout
+        ("tie_embd", c_bool),          # bool tie_embd
     ]
 
 
 class Qwen3WeightsCStruct(ctypes.Structure):
     _fields_ = [
-        ("nlayer", c_size_t),
-        ("dt_norm", DataType),
-        ("dt_mat", DataType),
-        ("transpose_linear_weights", c_int),
-        ("input_embd", c_void_p),
-        ("output_norm", c_void_p),
-        ("output_embd", c_void_p),
-        ("attn_norm", POINTER(c_void_p)),
-        ("attn_qkv", POINTER(c_void_p)),
-        ("attn_qkv_b", POINTER(c_void_p)),
-        ("attn_o", POINTER(c_void_p)),
-        ("ffn_norm", POINTER(c_void_p)),
-        ("ffn_gate_up", POINTER(c_void_p)),
-        ("ffn_down", POINTER(c_void_p)),
-        ("q_norm", POINTER(c_void_p)),
-        ("k_norm", POINTER(c_void_p)),
+        # 元信息
+        ("nlayer", c_size_t),          # size_t nlayer
+        ("dt_norm", DataType),         # infiniDtype_t dt_norm
+        ("dt_mat", DataType),          # infiniDtype_t dt_mat
+        ("transpose_linear_weights", c_int),  # int transpose_linear_weights
+        
+        # 全局共享权重
+        ("input_embd", c_void_p),      # const void *input_embd
+        ("output_embd", c_void_p),     # const void *output_embd
+        ("output_norm", c_void_p),     # const void *output_norm
+        
+        # 逐层权重数组 (长度为nlayer)
+        ("attn_norm", POINTER(c_void_p)),      # const void **attn_norm
+        ("attn_q_norm", POINTER(c_void_p)),    # const void **attn_q_norm
+        ("attn_k_norm", POINTER(c_void_p)),    # const void **attn_k_norm
+        
+        # QKV投影 - 分开存放
+        ("attn_q_proj", POINTER(c_void_p)),    # const void **attn_q_proj
+        ("attn_k_proj", POINTER(c_void_p)),    # const void **attn_k_proj
+        ("attn_v_proj", POINTER(c_void_p)),    # const void **attn_v_proj
+        ("attn_o_proj", POINTER(c_void_p)),    # const void **attn_o_proj
+        
+        # MLP层
+        ("mlp_norm", POINTER(c_void_p)),       # const void **mlp_norm
+        ("mlp_gate_proj", POINTER(c_void_p)),  # const void **mlp_gate_proj
+        ("mlp_up_proj", POINTER(c_void_p)),    # const void **mlp_up_proj
+        ("mlp_down_proj", POINTER(c_void_p)),  # const void **mlp_down_proj
     ]
-
-
-class JiugeModelCSruct(ctypes.Structure):
-    pass
 
 
 class Qwen3ModelCStruct(ctypes.Structure):
@@ -141,42 +119,14 @@ def __open_library__():
         )
     lib = ctypes.CDLL(lib_path)
     
-    # Jiuge model functions
-    lib.createJiugeModel.restype = POINTER(JiugeModelCSruct)
-    lib.createJiugeModel.argtypes = [
-        POINTER(JiugeMetaCStruct),  # JiugeMeta const *
-        POINTER(JiugeWeightsCStruct),  # JiugeWeights const *
-        DeviceType,  # DeviceType
-        c_int,  # int ndev
-        POINTER(c_int),  # int const *dev_ids
-    ]
-    lib.destroyJiugeModel.argtypes = [POINTER(JiugeModelCSruct)]
-    lib.createKVCache.argtypes = [POINTER(JiugeModelCSruct)]
-    lib.createKVCache.restype = POINTER(KVCacheCStruct)
-    lib.dropKVCache.argtypes = [POINTER(JiugeModelCSruct), POINTER(KVCacheCStruct)]
-    lib.inferBatch.restype = None
-    lib.inferBatch.argtypes = [
-        POINTER(JiugeModelCSruct),  # struct JiugeModel const *
-        POINTER(c_uint),  # unsigned int const *tokens
-        c_uint,  # unsigned int ntok
-        POINTER(c_uint),  # unsigned int const *req_lens
-        c_uint,  # unsigned int nreq
-        POINTER(c_uint),  # unsigned int const *req_pos
-        POINTER(POINTER(KVCacheCStruct)),  # struct KVCache **kv_caches
-        POINTER(c_float),  # float temperature
-        POINTER(c_uint),  # unsigned int topk
-        POINTER(c_float),  # float topp
-        POINTER(c_uint),  # unsigned int *output
-    ]
-
     # Qwen3 model functions
     lib.createQwen3Model.restype = POINTER(Qwen3ModelCStruct)
     lib.createQwen3Model.argtypes = [
-        POINTER(Qwen3MetaCStruct),  # Qwen3Meta const *
-        POINTER(Qwen3WeightsCStruct),  # Qwen3Weights const *
-        DeviceType,  # DeviceType
-        c_int,  # int ndev
-        POINTER(c_int),  # int const *dev_ids
+        POINTER(Qwen3MetaCStruct),
+        POINTER(Qwen3WeightsCStruct),
+        DeviceType,
+        c_int,
+        POINTER(c_int),
     ]
     lib.destroyQwen3Model.argtypes = [POINTER(Qwen3ModelCStruct)]
     lib.createQwen3KVCache.argtypes = [POINTER(Qwen3ModelCStruct)]
@@ -184,29 +134,21 @@ def __open_library__():
     lib.dropQwen3KVCache.argtypes = [POINTER(Qwen3ModelCStruct), POINTER(KVCacheCStruct)]
     lib.inferQwen3Batch.restype = None
     lib.inferQwen3Batch.argtypes = [
-        POINTER(Qwen3ModelCStruct),  # struct Qwen3Model const *
-        POINTER(c_uint),  # unsigned int const *tokens
-        c_uint,  # unsigned int ntok
-        POINTER(c_uint),  # unsigned int const *req_lens
-        c_uint,  # unsigned int nreq
-        POINTER(c_uint),  # unsigned int const *req_pos
+        POINTER(Qwen3ModelCStruct),    # struct Qwen3Model const *
+        POINTER(c_uint),               # unsigned int const *tokens
+        c_uint,                        # unsigned int ntok
+        POINTER(c_uint),               # unsigned int const *req_lens
+        c_uint,                        # unsigned int nreq
+        POINTER(c_uint),               # unsigned int const *req_pos
         POINTER(POINTER(KVCacheCStruct)),  # struct KVCache **kv_caches
-        POINTER(c_float),  # float temperature
-        POINTER(c_uint),  # unsigned int topk
-        POINTER(c_float),  # float topp
-        POINTER(c_uint),  # unsigned int *output
+        POINTER(c_float),              # float const *temperature (数组!)
+        POINTER(c_uint),               # unsigned int const *topk (数组!)
+        POINTER(c_float),              # float const *topp (数组!)
+        POINTER(c_uint),               # unsigned int *output
     ]
-
     return lib
 
-
 LIB = __open_library__()
-
-create_jiuge_model = LIB.createJiugeModel
-destroy_jiuge_model = LIB.destroyJiugeModel
-create_kv_cache = LIB.createKVCache
-drop_kv_cache = LIB.dropKVCache
-infer_batch = LIB.inferBatch
 
 create_qwen3_model = LIB.createQwen3Model
 destroy_qwen3_model = LIB.destroyQwen3Model

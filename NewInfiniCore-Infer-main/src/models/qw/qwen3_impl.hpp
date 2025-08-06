@@ -1,6 +1,7 @@
 #ifndef QWEN3_IMPL_H
 #define QWEN3_IMPL_H
 
+#include "infinicore_infer.h"
 /*
  * 
  * 此头文件定义了使用 InfiniCore 的 Jiuge transformer 模型实现的核心数据结构和接口。它提供：
@@ -16,6 +17,7 @@
 
 #include "../../allocator.hpp"
 #include "../../tensor.hpp"
+
 
 #include <condition_variable>
 #include <memory>
