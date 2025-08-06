@@ -20,6 +20,120 @@
 #include <thread>
 #include <vector>
 #include <cassert>
+#include <fstream>
+#include <iomanip>
+
+/*
+ * Debug utilities for comparing C++ vs Python implementations
+ * These functions save tensor data to files for comparison
+ */
+
+// Global debug flag - set to true to enable debug output
+static bool g_debug_enabled = false;
+
+void set_debug_mode(bool enabled) {
+    g_debug_enabled = enabled;
+}
+
+template<typename T>
+void save_tensor_debug(const std::shared_ptr<Tensor> &tensor, const std::string &name, 
+                      int layer = -1, const std::string &prefix = "cpp") {
+    if (!g_debug_enabled || !tensor) return;
+    
+    // Create filename
+    std::string filename;
+    if (layer >= 0) {
+        filename = prefix + "_layer_" + std::to_string(layer) + "_" + name + ".txt";
+    } else {
+        filename = prefix + "_" + name + ".txt";
+    }
+    
+    // Get tensor data to CPU
+    auto shape = tensor->shape();
+    size_t total_size = 1;
+    for (auto dim : shape) {
+        total_size *= dim;
+    }
+    
+    // Allocate host memory for tensor data
+    std::vector<T> host_data(total_size);
+    
+    // Copy from device to host
+    RUN_INFINI(infinirtMemcpy(host_data.data(), tensor->data(), 
+                             total_size * sizeof(T), INFINIRT_MEMCPY_D2H));
+    
+    // Synchronize to ensure copy is complete
+    RUN_INFINI(infinirtDeviceSynchronize());
+    
+    // Calculate statistics
+    T mean = 0, min_val = host_data[0], max_val = host_data[0];
+    for (size_t i = 0; i < total_size; ++i) {
+        mean += host_data[i];
+        min_val = std::min(min_val, host_data[i]);
+        max_val = std::max(max_val, host_data[i]);
+    }
+    mean /= total_size;
+    
+    T std_dev = 0;
+    for (size_t i = 0; i < total_size; ++i) {
+        T diff = host_data[i] - mean;
+        std_dev += diff * diff;
+    }
+    std_dev = std::sqrt(std_dev / total_size);
+    
+    // Save to file
+    std::ofstream file(filename);
+    file << std::scientific << std::setprecision(6);
+    file << "# Tensor: " << name << "\n";
+    file << "# Shape: ";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) file << "x";
+        file << shape[i];
+    }
+    file << "\n";
+    file << "# Total elements: " << total_size << "\n";
+    file << "# Mean: " << mean << "\n";
+    file << "# Std: " << std_dev << "\n";
+    file << "# Min: " << min_val << "\n";
+    file << "# Max: " << max_val << "\n";
+    file << "# Data:\n";
+    
+    // For large tensors, save first and last elements only
+    if (total_size > 1000) {
+        file << "# First 50 elements:\n";
+        for (size_t i = 0; i < std::min(size_t(50), total_size); ++i) {
+            file << host_data[i] << "\n";
+        }
+        file << "# Last 50 elements:\n";
+        for (size_t i = std::max(size_t(0), total_size - 50); i < total_size; ++i) {
+            file << host_data[i] << "\n";
+        }
+    } else {
+        // Save all elements for small tensors
+        for (size_t i = 0; i < total_size; ++i) {
+            file << host_data[i] << "\n";
+        }
+    }
+    
+    file.close();
+    printf("  Saved debug tensor: %s (shape: ", filename.c_str());
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) printf("x");
+        printf("%zu", shape[i]);
+    }
+    printf(")\n");
+}
+
+// Specialization for float16/bfloat16 tensors
+void save_tensor_debug_f16(const std::shared_ptr<Tensor> &tensor, const std::string &name, 
+                          int layer = -1, const std::string &prefix = "cpp") {
+    save_tensor_debug<float>(tensor, name, layer, prefix);
+}
+
+void save_tensor_debug_f32(const std::shared_ptr<Tensor> &tensor, const std::string &name, 
+                          int layer = -1, const std::string &prefix = "cpp") {
+    save_tensor_debug<float>(tensor, name, layer, prefix);
+}
 
 /*
  * 设备资源创建和初始化
@@ -419,6 +533,15 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
             RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),                // 目标：logits_in 的第 i 行
                                            rsrc.w_in_embd->data(tokens[i] * d),   // 源：tokens[i] 的嵌入
                                            dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+        }
+        
+        // Debug: Save input embeddings
+        if (g_debug_enabled) {
+            // Create input tokens tensor for debugging
+            auto tokens_tensor = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
+            RUN_INFINI(infinirtMemcpy(tokens_tensor->data(), tokens, sizeof(uint32_t) * ntok, INFINIRT_MEMCPY_H2D));
+            save_tensor_debug_f32(tokens_tensor, "input_ids", -1, "cpp");
+            save_tensor_debug_f32(logits_in, "input_embeddings", -1, "cpp");
         }
         
     
@@ -951,6 +1074,12 @@ workspace_size = std::max(workspace_size, temp_size);
          * 多头注意力块
          * ============================================================================
          */
+        
+        // Debug: Save layer input
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(logits_in, "input_hidden_states", layer);
+        }
+        
         // 1. 注意力
         
         /*
@@ -968,7 +1097,12 @@ workspace_size = std::max(workspace_size, temp_size);
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
-            rsrc.w_attn_norm[layer]->data(), stream));     
+            rsrc.w_attn_norm[layer]->data(), stream));
+        
+        // Debug: Save attention norm output
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(logits_out, "attn_norm_output", layer);
+        }     
         /*
          * Qwen3 注意力计算：分离 QKV + Q/K 归一化
          * 
@@ -1009,6 +1143,13 @@ workspace_size = std::max(workspace_size, temp_size);
             v_buf->data(), logits_out->data(),
             rsrc.w_attn_v_proj[layer]->data(),
             1.0, 0.0, stream));
+        
+        // Debug: Save QKV projections
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(q_buf, "attn_q_proj_raw", layer);
+            save_tensor_debug_f32(k_buf, "attn_k_proj_raw", layer);
+            save_tensor_debug_f32(v_buf, "attn_v_proj_raw", layer);
+        }
         
         // ============================================================================
         // 第二步：Qwen3 特有的 Q/K 归一化
@@ -1055,6 +1196,12 @@ workspace_size = std::max(workspace_size, temp_size);
                 k_head_input,                           // 输入：当前头的原始数据
                 rsrc.w_attn_k_norm[layer]->data(),      // 权重：[dh]
                 stream));
+        }
+        
+        // Debug: Save Q/K normalized outputs
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(q_norm_buf, "attn_q_normed", layer);
+            save_tensor_debug_f32(k_norm_buf, "attn_k_normed", layer);
         }
         // ============================================================================
         // 第三步：按头应用 RoPE
@@ -1201,6 +1348,11 @@ workspace_size = std::max(workspace_size, temp_size);
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));  // 通信后同步
         }
+        
+        // Debug: Save attention residual output
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(logits_in, "attn_residual_output", layer);
+        }
 
 
         /*
@@ -1227,6 +1379,11 @@ workspace_size = std::max(workspace_size, temp_size);
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_mlp_norm[layer]->data(), stream));
+        
+        // Debug: Save MLP norm output
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(logits_out, "mlp_norm_output", layer);
+        }
             
         
         /*
@@ -1256,11 +1413,24 @@ workspace_size = std::max(workspace_size, temp_size);
             up_buf->data(), logits_out->data(), rsrc.w_mlp_up_proj[layer]->data(),
             1.0, 0.0, stream));
         
+        // Debug: Save MLP Gate and Up projections
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(gate_buf, "mlp_gate_proj", layer);
+            save_tensor_debug_f32(up_buf, "mlp_up_proj", layer);
+        }
+        
         // 步骤 3: SwiGLU 激活 - 一次性完成 gate ⊙ SiLU(up)
         RUN_INFINI(infiniopSwiGLU(
             desc_swiglu, workspace, workspace_size,
             gate_buf->data(),    // 输出 (c): intermediate = gate ⊙ SiLU(up)
             up_buf->data(),    // 门控输入 (a): up_buf 投影结果
+            gate_buf->data(),      // SiLU输入 (b): gate_buf 投影结果，将应用 SiLU
+            stream));
+        
+        // Debug: Save MLP intermediate (after SwiGLU)
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(gate_buf, "mlp_intermediate", layer);
+        }
             gate_buf->data(),      // SiLU输入 (b): gate_buf 投影结果，将应用 SiLU
             stream));
         
@@ -1300,6 +1470,11 @@ workspace_size = std::max(workspace_size, temp_size);
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));  // 通信后同步
+        }
+        
+        // Debug: Save layer output
+        if (g_debug_enabled) {
+            save_tensor_debug_f32(logits_in, "layer_output", layer);
         }
     }
     
@@ -1762,4 +1937,19 @@ __C void destroyQwen3Model(struct Qwen3Model *model) {
 
     // 释放模型实例
     delete model;
+}
+
+/*
+ * 调试模式控制函数
+ * 
+ * 允许从 Python 接口启用或禁用 C++ 调试输出。
+ * 当启用时，会在推理过程中保存中间张量数据到文件。
+ */
+__C void setQwen3DebugMode(int enabled) {
+    set_debug_mode(enabled != 0);
+    if (enabled) {
+        printf("Qwen3 debug mode enabled - will save intermediate tensors\n");
+    } else {
+        printf("Qwen3 debug mode disabled\n");
+    }
 }
