@@ -112,4 +112,9 @@ inferQwen3Batch(struct Qwen3Model *,
            struct Qwen3KVCache **kv_caches,
            const float *temperature, const uint32_t *topk, const float *topp,
            uint32_t *output);
+
+/// @brief 启用或禁用调试模式（保存中间张量到文件）
+__C __export void
+setQwen3DebugMode(int enabled);
+
 #endif
