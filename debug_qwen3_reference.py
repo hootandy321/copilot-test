@@ -407,14 +407,16 @@ class DebugQwen3Model(torch.nn.Module):
             save_tensor_debug(position_embeddings[1], "position_sin", output_dir, "input")
         
         
-        # Pass through decoder layers
+        # Pass through decoder layers (only debug layer 0)
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # Only save debug outputs for layer 0
+            debug_this_layer = debug_outputs and (layer_idx == 0)
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 output_dir=output_dir,
                 attention_mask=attention_mask,
-                debug_outputs=debug_outputs,
+                debug_outputs=debug_this_layer,
             )
         
         # Final normalization

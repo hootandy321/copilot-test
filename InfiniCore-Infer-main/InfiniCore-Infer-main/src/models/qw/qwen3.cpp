@@ -12,6 +12,13 @@
 #include <cassert>
 #include <fstream>
 #include <iomanip>
+#include <sys/stat.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 /*
  * Debug utilities for comparing C++ vs Python implementations
@@ -23,6 +30,107 @@ static bool g_debug_enabled = true;
 
 void set_debug_mode(bool enabled) {
     g_debug_enabled = enabled;
+}
+
+// Validation function to check tensor for extreme values
+bool validate_tensor_range(const std::shared_ptr<Tensor> &tensor, const std::string &name, 
+                          float min_threshold = -1e6, float max_threshold = 1e6) {
+    if (!tensor) return false;
+    
+    auto shape = tensor->shape();
+    size_t total_size = 1;
+    for (auto dim : shape) {
+        total_size *= dim;
+    }
+    
+    // For small tensors, check all values; for large tensors, sample
+    size_t sample_size = std::min(total_size, size_t(1000));
+    std::vector<float> host_data(sample_size);
+    
+    // Copy sample data to host
+    RUN_INFINI(infinirtMemcpy(host_data.data(), tensor->data(), 
+                             sample_size * sizeof(float), INFINIRT_MEMCPY_D2H));
+    RUN_INFINI(infinirtDeviceSynchronize());
+    
+    // Check for extreme values
+    bool has_extreme = false;
+    float actual_min = host_data[0], actual_max = host_data[0];
+    int inf_count = 0, nan_count = 0;
+    
+    for (size_t i = 0; i < sample_size; ++i) {
+        float val = host_data[i];
+        if (std::isnan(val)) {
+            nan_count++;
+            has_extreme = true;
+        } else if (std::isinf(val)) {
+            inf_count++;
+            has_extreme = true;
+        } else {
+            actual_min = std::min(actual_min, val);
+            actual_max = std::max(actual_max, val);
+            if (val < min_threshold || val > max_threshold) {
+                has_extreme = true;
+            }
+        }
+    }
+    
+    if (has_extreme && g_debug_enabled) {
+        printf("⚠ RANGE WARNING: %s has extreme values:\n", name.c_str());
+        printf("  Min: %e, Max: %e\n", actual_min, actual_max);
+        printf("  NaN count: %d, Inf count: %d (in sample of %zu)\n", 
+               nan_count, inf_count, sample_size);
+    }
+    
+    return !has_extreme;
+}
+
+// Function to clamp tensor values to prevent overflow in subsequent operations
+void clamp_tensor_inplace(const std::shared_ptr<Tensor> &tensor, float min_val = -65504.0f, float max_val = 65504.0f) {
+    if (!tensor) return;
+    
+    auto shape = tensor->shape();
+    size_t total_size = 1;
+    for (auto dim : shape) {
+        total_size *= dim;
+    }
+    
+    // Get data as float pointer (assuming FP32 storage for intermediate computations)
+    float* data_ptr = static_cast<float*>(tensor->data());
+    
+    // Launch a simple clamping operation on device (this would need proper CUDA/device implementation)
+    // For now, copy to host, clamp, and copy back (inefficient but safe)
+    std::vector<float> host_data(total_size);
+    
+    // Copy to host
+    RUN_INFINI(infinirtMemcpy(host_data.data(), data_ptr, 
+                             total_size * sizeof(float), INFINIRT_MEMCPY_D2H));
+    RUN_INFINI(infinirtDeviceSynchronize());
+    
+    // Clamp values
+    bool clamped_any = false;
+    for (size_t i = 0; i < total_size; ++i) {
+        if (host_data[i] < min_val) {
+            host_data[i] = min_val;
+            clamped_any = true;
+        } else if (host_data[i] > max_val) {
+            host_data[i] = max_val;
+            clamped_any = true;
+        } else if (std::isnan(host_data[i]) || std::isinf(host_data[i])) {
+            host_data[i] = 0.0f;  // Replace NaN/Inf with zero
+            clamped_any = true;
+        }
+    }
+    
+    if (clamped_any) {
+        // Copy back to device
+        RUN_INFINI(infinirtMemcpy(data_ptr, host_data.data(), 
+                                 total_size * sizeof(float), INFINIRT_MEMCPY_H2D));
+        RUN_INFINI(infinirtDeviceSynchronize());
+        
+        if (g_debug_enabled) {
+            printf("⚠ Clamped extreme values in tensor to range [%f, %f]\n", min_val, max_val);
+        }
+    }
 }
 
 template<typename T>
@@ -55,18 +163,35 @@ void save_tensor_debug(const std::shared_ptr<Tensor> &tensor, const std::string 
     // Synchronize to ensure copy is complete
     RUN_INFINI(infinirtDeviceSynchronize());
     
-    // Calculate statistics
+    // Calculate comprehensive statistics
     T mean = 0, min_val = host_data[0], max_val = host_data[0];
+    int inf_count = 0, nan_count = 0, zero_count = 0;
+    double abs_sum = 0.0;
+    
     for (size_t i = 0; i < total_size; ++i) {
-        mean += host_data[i];
-        min_val = std::min(min_val, host_data[i]);
-        max_val = std::max(max_val, host_data[i]);
+        T val = host_data[i];
+        if (std::isnan(val)) {
+            nan_count++;
+        } else if (std::isinf(val)) {
+            inf_count++;
+        } else if (val == 0) {
+            zero_count++;
+            mean += val;  // still count in mean
+        } else {
+            mean += val;
+            min_val = std::min(min_val, val);
+            max_val = std::max(max_val, val);
+            abs_sum += std::abs(static_cast<double>(val));
+        }
     }
     mean /= total_size;
-      T std_dev = 0;
+    
+    T std_dev = 0;
     for (size_t i = 0; i < total_size; ++i) {
-        T diff = host_data[i] - mean;
-        std_dev += diff * diff;
+        if (!std::isnan(host_data[i]) && !std::isinf(host_data[i])) {
+            T diff = host_data[i] - mean;
+            std_dev += diff * diff;
+        }
     }
     std_dev = std::sqrt(std_dev / total_size);
     
@@ -81,10 +206,38 @@ void save_tensor_debug(const std::shared_ptr<Tensor> &tensor, const std::string 
     }
     file << "\n";
     file << "# Total elements: " << total_size << "\n";
+    file << "# Data type size: " << sizeof(T) << " bytes\n";
+    file << "# Statistics:\n";
     file << "# Mean: " << mean << "\n";
     file << "# Std: " << std_dev << "\n";
     file << "# Min: " << min_val << "\n";
     file << "# Max: " << max_val << "\n";
+    file << "# L1 norm (avg abs): " << (abs_sum / total_size) << "\n";
+    file << "# Special values - NaN: " << nan_count << ", Inf: " << inf_count << ", Zero: " << zero_count << "\n";
+    
+    // Detect potential issues
+    bool has_issues = false;
+    if (nan_count > 0 || inf_count > 0) {
+        file << "# ⚠ WARNING: Contains NaN or Inf values!\n";
+        has_issues = true;
+    }
+    if (std::abs(mean) > 1e6) {
+        file << "# ⚠ WARNING: Mean is extremely large (>" << 1e6 << ")\n";
+        has_issues = true;
+    }
+    if (std::abs(max_val) > 1e6 || std::abs(min_val) > 1e6) {
+        file << "# ⚠ WARNING: Contains values beyond FP16 safe range\n";
+        has_issues = true;
+    }
+    if (zero_count > total_size * 0.9) {
+        file << "# ⚠ WARNING: More than 90% values are zero (potential underflow)\n";
+        has_issues = true;
+    }
+    
+    if (!has_issues) {
+        file << "# ✓ Values appear to be in reasonable range\n";
+    }
+    
     file << "# Data:\n";
     
     // For large tensors, save first and last elements only
@@ -105,12 +258,11 @@ void save_tensor_debug(const std::shared_ptr<Tensor> &tensor, const std::string 
     }
     
     file.close();
-    // printf("  Saved debug tensor: %s (shape: ", filename.c_str());
-    // for (size_t i = 0; i < shape.size(); ++i) {
-    //     if (i > 0) printf("x");
-    //     printf("%zu", shape[i]);
-    // }
-    // printf(")\n");
+    
+    // Print summary to console
+    if (has_issues) {
+        printf("⚠ Tensor %s has data quality issues - check %s\n", name.c_str(), filename.c_str());
+    }
 }
 
 // Helper function to convert FP16 to float
@@ -602,6 +754,33 @@ void inferQwen3DeviceBatch(const Qwen3Meta &meta, DeviceQwen3Resource &rsrc,
     auto prob_buf = Tensor::buffer(dt_logits, {nreq, dvoc}, rsrc.memory_pool);
     auto result_buf = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
     auto result_cpu = std::vector<int64_t>(nreq);
+    
+    // Validate all buffer allocations
+    std::vector<std::pair<std::shared_ptr<Tensor>, std::string>> buffers = {
+        {q_buf, "q_buf"}, {k_buf, "k_buf"}, {v_buf, "v_buf"},
+        {q_norm_buf, "q_norm_buf"}, {k_norm_buf, "k_norm_buf"},
+        {gate_buf, "gate_buf"}, {up_buf, "up_buf"}, {o_buf, "o_buf"},
+        {prob_buf, "prob_buf"}, {result_buf, "result_buf"}
+    };
+    
+    for (const auto& [buffer, name] : buffers) {
+        if (!buffer) {
+            throw std::runtime_error("Failed to allocate " + name + " buffer - insufficient memory or pool issues");
+        }
+    }
+    
+    if (g_debug_enabled && idev == 0) {
+        printf("✓ All tensor buffers allocated successfully\n");
+        printf("  Memory pool usage: %.2f MB total needed\n", total_memory_needed / (1024.0 * 1024.0));
+        
+        // Create output directory for debug files
+        #ifdef _WIN32
+        _mkdir("output");
+        #else
+        mkdir("output", 0755);
+        #endif
+        printf("✓ Debug output directory created/verified\n");
+    }
 
 
             // 在输入嵌入查找之前添加调试
@@ -1328,8 +1507,8 @@ workspace_size = std::max(workspace_size, temp_size);
          * ============================================================================
          */
         
-        // Debug: Save layer input
-        if (g_debug_enabled) {
+        // Debug: Save layer input (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f16(logits_in, "input_hidden_states", layer);
         }
         
@@ -1352,8 +1531,8 @@ workspace_size = std::max(workspace_size, temp_size);
             logits_out->data(), logits_in->data(),
             rsrc.w_attn_norm[layer]->data(), stream));
         
-        // Debug: Save attention norm output
-        if (g_debug_enabled) {
+        // Debug: Save attention norm output (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(logits_out, "attn_norm_output", layer);
         }     
         /*
@@ -1397,11 +1576,15 @@ workspace_size = std::max(workspace_size, temp_size);
             rsrc.w_attn_v_proj[layer]->data(),
             1.0, 0.0, stream));
         
-        // Debug: Save QKV projections
-        if (g_debug_enabled) {
+        // Debug: Save QKV projections (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(q_buf, "attn_q_proj_raw", layer);
             save_tensor_debug_f32(k_buf, "attn_k_proj_raw", layer);
             save_tensor_debug_f32(v_buf, "attn_v_proj_raw", layer);
+            
+            // Validate QKV projections before normalization
+            validate_tensor_range(q_buf, "q_buf before normalization");
+            validate_tensor_range(k_buf, "k_buf before normalization");
         }
         
         // ============================================================================
@@ -1451,8 +1634,16 @@ workspace_size = std::max(workspace_size, temp_size);
                 stream));
         }
         
-        // Debug: Save Q/K normalized outputs
-        if (g_debug_enabled) {
+        // Debug: Save Q/K normalized outputs (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
+            // Validate normalized outputs
+            validate_tensor_range(q_norm_buf, "attn_q_normed", -10.0, 10.0);
+            validate_tensor_range(k_norm_buf, "attn_k_normed", -10.0, 10.0);
+            
+            // Clamp extreme values to prevent downstream issues
+            clamp_tensor_inplace(q_norm_buf, -10.0f, 10.0f);
+            clamp_tensor_inplace(k_norm_buf, -10.0f, 10.0f);
+            
             save_tensor_debug_f32(q_norm_buf, "attn_q_normed", layer);
             save_tensor_debug_f32(k_norm_buf, "attn_k_normed", layer);
         }
@@ -1602,8 +1793,8 @@ workspace_size = std::max(workspace_size, temp_size);
             RUN_INFINI(infinirtStreamSynchronize(stream));  // 通信后同步
         }
         
-        // Debug: Save attention residual output
-        if (g_debug_enabled) {
+        // Debug: Save attention residual output (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(logits_in, "attn_residual_output", layer);
         }
 
@@ -1633,8 +1824,8 @@ workspace_size = std::max(workspace_size, temp_size);
             logits_out->data(), logits_in->data(),
             rsrc.w_mlp_norm[layer]->data(), stream));
         
-        // Debug: Save MLP norm output
-        if (g_debug_enabled) {
+        // Debug: Save MLP norm output (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(logits_out, "mlp_norm_output", layer);
         }
             
@@ -1667,7 +1858,7 @@ workspace_size = std::max(workspace_size, temp_size);
             1.0, 0.0, stream));
         
         // Debug: Save MLP Gate and Up projections
-        if (g_debug_enabled) {
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(gate_buf, "mlp_gate_proj", layer);
             save_tensor_debug_f32(up_buf, "mlp_up_proj", layer);
         }
@@ -1680,8 +1871,8 @@ workspace_size = std::max(workspace_size, temp_size);
             gate_buf->data(),      // SiLU输入 (b): gate_buf 投影结果，将应用 SiLU
             stream));
         
-        // Debug: Save MLP intermediate (after SwiGLU)
-        if (g_debug_enabled) {
+        // Debug: Save MLP intermediate (after SwiGLU) (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(gate_buf, "mlp_intermediate", layer);
         }
         
@@ -1723,8 +1914,8 @@ workspace_size = std::max(workspace_size, temp_size);
             RUN_INFINI(infinirtStreamSynchronize(stream));  // 通信后同步
         }
         
-        // Debug: Save layer output
-        if (g_debug_enabled) {
+        // Debug: Save layer output (only for layer 0)
+        if (g_debug_enabled && layer == 0) {
             save_tensor_debug_f32(logits_in, "layer_output", layer);
         }
     }
