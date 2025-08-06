@@ -25,6 +25,9 @@ import safetensors
 # Set default device
 torch.set_default_device("cpu")
 
+# Add the scripts directory to Python path for imports
+sys.path.append(os.path.join(os.path.dirname(__file__), 'NewInfiniCore-Infer-main', 'scripts'))
+
 # Import the proper Qwen3 API
 try:
     from libinfinicore_infer import (
@@ -189,8 +192,8 @@ class Qwen3MetaFromConfig(Qwen3MetaCStruct):
             epsilon=config.get("rms_norm_eps", 1e-6),
             theta=config.get("rope_theta", 10000.0),
             end_token=config.get("eos_token_id", 2),
-            sliding_windows=None,  # TODO: Handle sliding window config
-            layer_types=None,      # TODO: Handle layer types config
+            sliding_windows=None,  # NULL pointer for default behavior
+            layer_types=None,      # NULL pointer for default behavior
         )
         self.torch_dtype_logits = dtype
 
@@ -570,11 +573,11 @@ class QwenForCausalLM:
         return self.meta.dctx
 
     def create_kv_cache(self):
-        # FIXED: Use proper Qwen3 KV cache API
+        # FIXED: Return the raw C pointer (same pattern as jiuge.py)
         return create_qwen3_kv_cache(self.model_instance)
 
     def drop_kv_cache(self, kv_cache):
-        # FIXED: Use proper Qwen3 KV cache API
+        # FIXED: Use proper Qwen3 KV cache API 
         drop_qwen3_kv_cache(self.model_instance, kv_cache)
 
     def batch_infer_one_round(self, tasks: List[InferTask]):
