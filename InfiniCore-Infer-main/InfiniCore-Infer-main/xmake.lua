@@ -21,3 +21,23 @@ target("infinicore_infer")
     add_installfiles("include/infinicore_infer.h", {prefixdir = "include"})
     add_installfiles("include/infinicore_infer/models/*.h", {prefixdir = "include/infinicore_infer/models"})
 target_end()
+
+-- Add QW Matrix Test target
+target("qw_matrix_test")
+    set_kind("binary")
+    
+    add_includedirs("include")
+    add_includedirs(".", { public = false })  -- For access to src/ headers
+    add_includedirs("../InfiniCore-main/include", { public = false })  -- For InfiniCore headers
+    
+    add_deps("infinicore_infer")
+    add_links("infinicore_infer")
+    
+    set_languages("cxx17")
+    set_warnings("all")  -- Reduce warning level for test
+    
+    add_files("qw_matrix_test.cpp")
+    
+    -- Add runtime library path
+    add_rpathdirs("$(buildir)")
+target_end()
